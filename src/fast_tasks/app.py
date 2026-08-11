@@ -25,6 +25,14 @@ def within(value: str, limit: int, what: str) -> None:
         raise QueueError(f"{what} is {len(value)} characters and a store keeps {limit} of them, so the write is one the database refuses or quietly cuts short")
 
 
+def keyed(key: str) -> None:
+    """what a key has to be for a store to tell one run from another by it. a key of no characters is the one value the stores cannot agree on: a column takes it as a name held once, and redis reads it as no key at all — so the same call folds every enqueue into one row on a database and writes a row every time on redis"""
+    if not key:
+        raise QueueError("a key of no characters names nothing, and what makes a run single is the name no other run may take")
+
+    within(key, KEY_LIMIT, f"the key '{key}'")
+
+
 def trigger_for(every: float | timedelta | None, cron: str | None) -> Trigger | None:
     if every is not None:
         return Interval(every.total_seconds() if isinstance(every, timedelta) else every)
@@ -93,7 +101,7 @@ class FastTasks:
     def build(self, task: Task, due_at: datetime, payload: dict, key: str | None, priority: int | None) -> Run:
         """the instant is settled here and never in a store: a datetime with no zone is the utc one it reads as, and three stores each deciding that for themselves is the same value naming three instants"""
         if key is not None:
-            within(key, KEY_LIMIT, f"the key '{key}'")
+            keyed(key)
 
         return Run(name=task.name, queue=task.queue, payload=payload, key=key, due_at=as_utc(due_at), max_attempts=task.max_attempts, timeout=task.timeout, retry_policy=task.retry_policy, retry_delay=task.retry_delay, max_retry_delay=task.max_retry_delay, priority=task.priority if priority is None else priority)
 

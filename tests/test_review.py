@@ -608,7 +608,7 @@ async def test_a_name_the_worker_beside_this_one_knows_is_not_destroyed_by_this_
 
 
 async def test_a_name_nobody_knows_backs_off_instead_of_being_asked_for_ever(app):
-    """what is never destroyed has to stop costing something, and the backoff is what does that: the same growth every other retry gets, up to the ceiling"""
+    """what is never destroyed has to stop costing something, and the backoff is what does that. it is the base delay of the run and never a growing one: the attempt is given back, so the wait is worked out from the same attempt every time — which is the price of never spending a run's budget on a deploy"""
     written = await app.store.add(Run(name="nobody_knows", retry_policy=RetryPolicy.FIXED, retry_delay=30))
 
     worker = Worker(app, poll=0.05)
@@ -1041,3 +1041,67 @@ def test_an_interval_no_store_could_tell_apart_is_refused_where_it_is_written(ap
         app.task("often", every=0.0000004)(lambda: None)
 
     assert Interval(0.000001), "and the finest span a store can still tell apart is one that works"
+
+
+async def test_an_id_a_pruning_freed_is_never_handed_to_the_run_after_it(app):
+    """sqlite hands out the highest id it can see plus one, so pruning the newest settled run gave its id to the next run written — and a caller holding an id from before the pruning read, and called off, somebody else's run"""
+    from fast_tasks.store.sqlalchemy import SqlAlchemyStore
+
+    if not isinstance(app.store, SqlAlchemyStore):
+        pytest.skip("only a database counts its own ids, and only sqlite ever counts one back down")
+
+    @app.task("work")
+    async def work():
+        return None
+
+    dropped = await app.enqueue("work", payload={"which": "the one that was pruned"})
+    worker = Worker(app, keep=timedelta(seconds=0))
+
+    await worker.run_once()
+    await worker.drain()
+    await wait_until(lambda: worker.free == worker.concurrency)
+
+    assert await app.store.purge(now() + timedelta(seconds=1), PURGE_LIMIT) == 1
+
+    written = await app.enqueue("work", payload={"which": "the one written after it"})
+
+    assert written.id != dropped.id, "the id of a run that was pruned is spent, and never handed out again"
+    assert await app.get(dropped.id) is None, "so what a caller holding it reads is nothing, and never a run belonging to somebody else"
+
+
+async def test_a_lease_running_out_this_very_instant_is_one_the_worker_still_holds(app):
+    """the range redis read the expired leases with took in the instant itself, where every other store stops short of it — so on redis alone a run was handed to a second worker in the moment the first was still working it"""
+    written = await app.store.add(Run(name="work", max_attempts=3))
+    moment = now()
+
+    taken = await app.store.claim("worker-1", ("default",), 1, timedelta(seconds=60), moment)
+
+    assert await app.store.reclaim(taken[0].lease_until) == 0, "a lease is held up to the instant it runs out, and not up to the one before it"
+    assert (await app.get(written.id)).status == RunStatus.RUNNING
+
+
+async def test_a_run_that_is_over_is_kept_until_it_is_older_than_the_instant_asked_for(app):
+    """the same range, one method along: what a pruning drops is a run that finished strictly before the instant, and redis dropped the ones that finished exactly on it"""
+    written = await app.store.add(Run(name="work"))
+    taken = await app.store.claim("worker-1", ("default",), 1, timedelta(seconds=60), now())
+    finished = now()
+
+    await app.store.complete(taken[0].id, "worker-1", finished, None)
+
+    assert await app.store.purge(finished, PURGE_LIMIT) == 0
+    assert await app.get(written.id) is not None
+    assert await app.store.purge(finished + timedelta(microseconds=1), PURGE_LIMIT) == 1
+
+
+async def test_a_key_of_no_characters_is_refused_where_it_is_written(app):
+    """a column takes an empty key as a name that can be held once and redis reads it as no key at all, so the same call folded every enqueue into one row on a database and wrote a row every time on redis — and nothing anywhere said which of the two an application was getting"""
+
+    @app.task("work")
+    async def work():
+        return None
+
+    with pytest.raises(QueueError, match="names nothing"):
+        await app.enqueue("work", key="")
+
+    assert await app.count() == 0, "and nothing was written on the way to finding that out"
+    assert await app.enqueue("work", key="k"), "the shortest key a store can tell runs apart by is one that works"

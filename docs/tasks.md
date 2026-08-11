@@ -108,6 +108,12 @@ again = await app.enqueue("send_email", key="welcome:42", to="somebody@example.c
 assert again.id == first.id
 ```
 
+A key is refused where it is written if it is longer than the column a store keeps it in, and if it has
+no characters at all. An empty key is the one value the stores cannot agree on: a column takes it as a
+name that can be held once, and Redis reads it as no key at all — so the same call would fold every
+enqueue into one row on a database and write a row every time on Redis, with nothing in an application
+to say which of the two it was getting.
+
 ## 🚚 Queues
 
 A task may name a queue, and a worker names the queues it serves. That is how a slow task is kept from

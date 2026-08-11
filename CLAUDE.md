@@ -245,6 +245,7 @@ Things that are the way they are for a reason:
 - **`limited()`** puts the row limit in a derived table, because MySQL refuses a `LIMIT` directly inside an `IN`.
 - **`take_back()` asserts the state again in the update, and never trusts the batch `limited()` handed it.** The subselect is read once and then held, so a row the statement waited on a lock for is written whatever it has since become. With the condition only in the subselect, a reclaim took back a run another worker had legitimately claimed in that moment — the same run on two workers at once, which is the one thing none of this may ever do.
 - **`insert` only reads an `IntegrityError` as "the key is taken" when there is a key.** A keyless run never raced anybody for one, so swallowing that refusal would hand the caller somebody else's run.
+- **`sqlite_autoincrement` is what makes an id mean one run for ever.** SQLite hands out the highest id it can see plus one, so pruning the newest settled run gives its id to the run written after it — and a caller holding an id from before the pruning reads, and calls off, somebody else's. PostgreSQL sequences and the persisted InnoDB counter never go back, and this is what puts SQLite beside them.
 
 SQLite across processes needs WAL and a busy timeout — see `docs/stores.md`.
 
@@ -281,6 +282,7 @@ Hard constraints:
 - **`maxmemory-policy` must be `noeviction`.** An eviction takes the run hash without touching the lane it waits in. The store steps over that everywhere — the claim script, the read that follows it, and the reclaim all check the run is still there — but what an eviction costs is the run itself, which no code can give back.
 - **A production client needs its own timeouts.** redis-py waits forever by default, and a connection whose network went away leaves a worker alive, polling nothing and answering nobody.
 - **`count` is a scan.** Redis has no index over a hash. It is for an operator watching depth, not for a hot path, and it skips a run a pruning already dropped mid-scan.
+- **The ranges `RECLAIM` and `PURGE` read stop short of the instant they are given.** A sorted-set range is inclusive where every other store is strict, and a lease taken back the instant it runs out — rather than after it — puts the run on a second worker while the first is still working it.
 
 ---
 
@@ -332,6 +334,7 @@ Rules the suite enforces on itself:
 
 - **Coverage stays at 100%, branches included.** It is a gate, not an aspiration.
 - **Every store answers the same contract.** `tests/test_store_contract.py` is written against the interface and parametrized over every reachable store. Add a new backend to the fixture in `tests/conftest.py` and it inherits the whole suite.
+- **And it answers it the same way.** A suite written by hand only ever asks the questions somebody thought to ask, so `tests/test_differential.py` asks the ones nobody did: a seeded script of every operation, run against each store and against `MemoryStore`, compared on every field of every run, every answer and every count. Both of the drifts it found were invisible to a contract suite already passing everywhere.
 - **A test never waits without a bound.** Use `wait_until` from `tests/conftest.py`. `pytest-timeout` is set to 120s with `timeout_method = "thread"`, so a hang becomes a failure with every stack dumped.
 - **A store nobody can reach is not collected.** Memory and SQLite always run; Redis, MySQL and PostgreSQL join when their port answers. `make coverage` needs all three.
 - **Run against a real MySQL before believing anything about MySQL.** Its `DATETIME` rounding is invisible to SQLite and PostgreSQL.
@@ -343,6 +346,7 @@ Files worth knowing:
 | File | What it is for |
 | --- | --- |
 | `tests/test_store_contract.py` | the one suite every store answers |
+| `tests/test_differential.py` | one seeded script of every operation, answered by each store and compared field by field against `MemoryStore` |
 | `tests/test_review.py` | one test per bug a line-by-line reading found, each named after what it would have caught |
 | `tests/test_disasters.py` | clock skew, dying processes, handlers calling `sys.exit`, results the store cannot write |
 | `tests/test_many_machines.py` | separate interpreters against one database, which is what containers are |
@@ -437,7 +441,8 @@ one line.
 Anything that could never work is refused **where it is written**, not at three in the morning: a poll
 of zero, a concurrency of zero, a lease that has already run out, a worker serving no queues or one no
 task could ever be declared with, a cron expression that matches nothing, an interval finer than the
-microsecond a store keeps, a task asking for an interval and a cron at once. Each one carries a message
+microsecond a store keeps, a task asking for an interval and a cron at once, a key of no characters —
+which a column takes as a name held once and Redis reads as no key at all. Each one carries a message
 that says what was asked for and why it cannot be.
 
 **Prose in `docs/`**

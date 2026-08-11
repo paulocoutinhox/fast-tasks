@@ -26,8 +26,8 @@ raises.
 Timestamps are held as naive UTC and read back as aware UTC, because MySQL keeps no offset and a
 queue that guesses one runs tasks an hour late.
 
-Two indexes carry the whole load: `(queue, status, priority, due_at)` answers every claim, and
-`(status, lease_until)` answers every reclaim.
+Three indexes carry the whole load: `(queue, status, priority, due_at)` answers every claim,
+`(status, lease_until)` answers every reclaim, and `(status, finished_at)` answers every pruning.
 
 ### 📁 SQLite across processes
 
@@ -42,6 +42,12 @@ async with engine.begin() as connection:
 
 Without write-ahead logging the second process meets a locked database. With it, this is a fine
 setup for a single machine. For several machines, use a database several machines can reach.
+
+The table asks SQLite for a counter that only ever goes up. Left to itself SQLite hands out the highest
+id it can see plus one, so pruning the newest settled run gives that id to the next run written — and
+whoever kept an id from before the pruning goes on to read, and to call off, somebody else's run. The
+sequences of PostgreSQL and the persisted counter of InnoDB never do that, and this is what makes an id
+mean the same thing on all three.
 
 ## 🔴 Redis
 
@@ -156,6 +162,16 @@ answers "changed" for a row it did not change breaks the guarantee for everybody
 and one a worker never had anything to try is given back. A store that treats them as the same method
 spends a run's whole budget on a rolling deploy.
 
+A lease is held up to the instant it runs out and not up to the one before it, and a pruning drops a
+run that finished **strictly** before the instant it was given. Both are boundaries a store is easy to
+get a microsecond wrong on, and a reclaim a moment early puts a run on a second worker while the first
+is still working it.
+
 The suite in `tests/test_store_contract.py` is written against the interface and parametrized over
 every store. Add yours to the fixture and it inherits the whole thing — that is the intended way to
 know a new backend is correct.
+
+Beside it, `tests/test_differential.py` runs one seeded script of every operation against your store
+and against `MemoryStore`, and compares every field of every run, every answer and every count. A suite
+written by hand only asks the questions somebody thought to ask, and two of the drifts found so far were
+answers nobody had thought to compare.

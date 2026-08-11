@@ -73,9 +73,9 @@ end
 return taken
 """
 
-# a lease nobody renewed belongs to a process that is gone, and what it held goes back or ends here. it takes a batch and not everything: redis runs a script to the end before it answers anybody else, so an outage that expired a hundred thousand leases would freeze the whole server — the rest is picked up by the next pass
+# a lease nobody renewed belongs to a process that is gone, and what it held goes back or ends here. it takes a batch and not everything: redis runs a script to the end before it answers anybody else, so an outage that expired a hundred thousand leases would freeze the whole server — the rest is picked up by the next pass. the range stops short of the instant itself, because a lease running out exactly now is one every other store still holds — and taking it back a moment early puts the run on a second worker while the first is still working it
 RECLAIM = """
-local expired = redis.call('ZRANGEBYSCORE', ARGV[2] .. ':leased', '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[3]))
+local expired = redis.call('ZRANGEBYSCORE', ARGV[2] .. ':leased', '-inf', '(' .. ARGV[1], 'LIMIT', 0, tonumber(ARGV[3]))
 
 for _, id in ipairs(expired) do
   local key = ARGV[2] .. ':run:' .. id
@@ -167,9 +167,9 @@ return 1
 """
 
 
-# what a run over is still doing here is being held in memory, and a batch at a time because a script holds the whole server while it works
+# what a run over is still doing here is being held in memory, and a batch at a time because a script holds the whole server while it works. the range stops short of the instant itself, because what every other store drops is a run that finished strictly before it
 PURGE = """
-local gone = redis.call('ZRANGEBYSCORE', ARGV[2] .. ':settled', '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[3]))
+local gone = redis.call('ZRANGEBYSCORE', ARGV[2] .. ':settled', '-inf', '(' .. ARGV[1], 'LIMIT', 0, tonumber(ARGV[3]))
 
 for _, id in ipairs(gone) do
   local key = ARGV[2] .. ':run:' .. id
