@@ -9,6 +9,7 @@ help:
 	@echo "  make servers    start the redis, mysql and postgres the full suite needs"
 	@echo "  make test       run the suite"
 	@echo "  make coverage   run the suite with the 100% branch coverage gate"
+	@echo "  make stress     run many machines against every server that answers"
 	@echo "  make lint       check the code"
 	@echo "  make format     format the code"
 	@echo "  make build      build the wheel and the sdist"
@@ -32,6 +33,9 @@ test:
 
 coverage:
 	$(VENV)/bin/python -m pytest --cov
+
+stress:
+	$(VENV)/bin/python -m pytest -m stress -v
 
 lint:
 	$(VENV)/bin/python -m ruff check .

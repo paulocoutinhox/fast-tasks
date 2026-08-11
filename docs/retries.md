@@ -39,8 +39,13 @@ second comes back in the same second.
 
 > **The fraction is drawn per run, and that is the whole point.** Ten thousand runs work the delay out
 > from the same numbers, so a fixed multiplier — even a large one — hands the herd back whole an hour
-> later. The draw is never below what the policy without jitter says, so backing off is still backing
-> off; it only ever spreads the return.
+> later. Below the ceiling the draw only ever adds, so backing off is still backing off.
+>
+> **The ceiling is what the draw happens under, and never what the drawn delay is cut down to.** A herd
+> that has doubled its way past `max_retry_delay` would otherwise work out the very same wait every
+> time, which is the one case jitter exists for and the one case it used to do nothing in. So the
+> growth is held under the ceiling first and spread afterwards: the wait still lands within
+> `max_retry_delay`, and it still lands somewhere different for each of them.
 
 ## 🚚 A name this worker has never heard of
 
@@ -59,6 +64,11 @@ that bounced it three times a task allowed three attempts would die on its first
 > **A name nobody knows waits instead of dying**, which is the other side of that. It comes back at the
 > policy's first delay each time, because nothing is counting up behind it to back off from — so a typo
 > sits in the queue, asked for once every `retry_delay`, where an operator can see it and cancel it.
+
+That path belongs to the **lookup** and never to the handler. A handler that raises `UnknownTask`
+itself — one fanning out to a task nobody registered — has a bug, and it is retried and ended by the
+policy like any other failure. Reading it as a rolling deploy instead would hand the run back with its
+attempt given back for ever, repeating on every poll everything the handler managed before it raised.
 
 ## 🛑 A handler that asks the process to stop
 

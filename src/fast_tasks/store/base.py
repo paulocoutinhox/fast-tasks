@@ -12,6 +12,13 @@ RECLAIM_BATCH = 500
 # the longest a worker may be called, which is what every store sizes the column it keeps that name in. a pod is named after its deployment and its namespace, and a name that does not fit is a worker whose every claim the database refuses
 WORKER_NAME_LIMIT = 128
 
+# the longest a task may be called, and the longest a key may be. a value past what the column holds is a write the database refuses — and on one that does not refuse it, a value quietly cut short, which is two occurrences of two different minutes becoming one run
+TASK_NAME_LIMIT = 255
+KEY_LIMIT = 255
+
+# the longest a queue may be called
+QUEUE_LIMIT = 64
+
 
 class Store(ABC):
     """where runs live. every method that changes a run is conditional on the state that run was in, which is what makes two workers safe without a lock anywhere"""

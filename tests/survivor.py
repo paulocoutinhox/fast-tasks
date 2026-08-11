@@ -5,13 +5,13 @@ import sys
 from pathlib import Path
 
 from fast_tasks.app import FastTasks
-from fast_tasks.store.sqlalchemy import SqlAlchemyStore
 from fast_tasks.worker import Worker
-from tests.fleet import build_engine
+from tests.fleet import build_store
 
 
-def build(database: str, output: str):
-    app = FastTasks(SqlAlchemyStore(build_engine(database)))
+def build(url: str, output: str):
+    store, _ = build_store(url)
+    app = FastTasks(store)
 
     @app.task("slow", max_attempts=3, timeout=300)
     async def slow():
@@ -25,8 +25,8 @@ def build(database: str, output: str):
     return app
 
 
-async def main(database: str, output: str, seconds: float) -> None:
-    app = build(database, output)
+async def main(url: str, output: str, seconds: float) -> None:
+    app = build(url, output)
     worker = Worker(app, poll=0.02, lease=__import__("datetime").timedelta(seconds=1), grace=0.5)
     polling = asyncio.create_task(worker.run())
 

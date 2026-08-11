@@ -1,4 +1,5 @@
 import asyncio
+import random
 from datetime import datetime, timedelta
 
 from sqlalchemy import JSON, BigInteger, Column, DateTime, Float, Index, Integer, MetaData, String, Table, Text, TypeDecorator, and_, delete, func, select, update
@@ -9,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from fast_tasks.clock import as_utc, naive_utc
 from fast_tasks.retry import RetryPolicy
 from fast_tasks.run import SETTLED, Run, RunStatus
-from fast_tasks.store.base import CLAIM_SPREAD, RECLAIM_BATCH, WORKER_NAME_LIMIT, Store
+from fast_tasks.store.base import CLAIM_SPREAD, KEY_LIMIT, QUEUE_LIMIT, RECLAIM_BATCH, TASK_NAME_LIMIT, WORKER_NAME_LIMIT, Store
 
 # the store keeps its own metadata, so building its table never touches a table of the application around it
 metadata = MetaData()
@@ -17,10 +18,13 @@ metadata = MetaData()
 # innodb answers contention by rolling one side back and asking for the transaction again, which is the handling mysql documents and not a workaround: 1213 is a deadlock and 1205 is a lock it waited too long for
 CONTENDED = frozenset({1205, 1213})
 
-TRIES = 5
+TRIES = 8
 
-# short, and growing, because the other side only needs to finish the statement it is already in
-BACKOFF = 0.01
+# short to begin with, because the other side only needs to finish the statement it is already in — and doubling, because contention on a hot queue comes in bursts that outlast a schedule only ever adding milliseconds. measured against innodb with forty claims and a reclaim on the same rows: five tries growing by ten milliseconds left outcomes the store refused on every single run, and eight doubling ones left none
+BACKOFF = 0.005
+
+# and drawn, for the same reason a retry delay is drawn: every transaction innodb rolled back works the same wait out from the same numbers, so a schedule they all share brings the whole herd back in lockstep to deadlock on each other again and spend every try doing it
+SPREAD = 1.0
 
 
 def contended(error: DBAPIError) -> bool:
@@ -38,7 +42,7 @@ async def under_contention(work):
             if not contended(error):
                 raise
 
-            await asyncio.sleep(BACKOFF * (attempt + 1))
+            await asyncio.sleep(BACKOFF * (2**attempt) * (1 + random.uniform(0, SPREAD)))
 
     return await work()
 
@@ -67,9 +71,9 @@ runs = Table(
     "fast_tasks_run",
     metadata,
     Column("id", BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True),
-    Column("key", String(255), nullable=True, unique=True),
-    Column("name", String(255), nullable=False),
-    Column("queue", String(64), nullable=False, default="default"),
+    Column("key", String(KEY_LIMIT), nullable=True, unique=True),
+    Column("name", String(TASK_NAME_LIMIT), nullable=False),
+    Column("queue", String(QUEUE_LIMIT), nullable=False, default="default"),
     Column("payload", JSON, nullable=False, default=dict),
     Column("status", String(16), nullable=False, default=RunStatus.PENDING.value),
     Column("priority", Integer, nullable=False, default=0),
@@ -261,15 +265,17 @@ class SqlAlchemyStore(Store):
         released = {"worker": None, "lease_until": None, "started_at": None}
 
         async with self.sessions() as session:
-            spent = update(runs).where(limited(and_(expired, runs.c.attempts >= runs.c.max_attempts), RECLAIM_BATCH)).values(status=RunStatus.FAILED.value, finished_at=moment, error="the worker holding this run stopped answering", error_type="LeaseExpired", **released)
-            gave_up = (await session.execute(spent)).rowcount
-
-            again = update(runs).where(limited(and_(expired, runs.c.attempts < runs.c.max_attempts), RECLAIM_BATCH)).values(status=RunStatus.PENDING.value, due_at=moment, **released)
-            requeued = (await session.execute(again)).rowcount
+            # the two statements share the batch, because what the constant bounds is how long one pass holds the store and not how much either half of it writes
+            gave_up = await self.take_back(session, and_(expired, runs.c.attempts >= runs.c.max_attempts), RECLAIM_BATCH, {"status": RunStatus.FAILED.value, "finished_at": moment, "error": "the worker holding this run stopped answering", "error_type": "LeaseExpired", **released})
+            requeued = await self.take_back(session, and_(expired, runs.c.attempts < runs.c.max_attempts), RECLAIM_BATCH - gave_up, {"status": RunStatus.PENDING.value, "due_at": moment, **released})
 
             await session.commit()
 
             return gave_up + requeued
+
+    async def take_back(self, session, expired, size: int, values: dict) -> int:
+        """the batch is named by a subselect the database reads once and then holds, so the state those rows were named for is asserted again by the update itself. without it, a row this statement waited on a lock for is written whatever it has since become — and a lease another worker took over in that moment is taken straight back out from under it"""
+        return (await session.execute(update(runs).where(expired, limited(expired, size)).values(**values))).rowcount
 
     async def purge(self, before: datetime, limit: int) -> int:
         """a settled run is still being indexed, counted and backed up, and nothing ever reads it again"""

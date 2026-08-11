@@ -50,6 +50,11 @@ select = ["E4", "E7", "E9", "F", "I"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+markers = ["stress: many separate processes against a real server, which is minutes and not seconds — run by `make stress`"]
+
+# the stress suite is left out of every ordinary run, because a suite nobody waits for is a suite nobody runs
+addopts = ["-m", "not stress"]
+
 # no test runs forever: a hang becomes a failure with a traceback instead of a runner burning for hours
 timeout = 120
 

@@ -125,7 +125,8 @@ class Worker:
         if self.free <= 0:
             return []
 
-        claimed = await self.app.store.claim(self.name, self.queues, self.free, self.lease, moment)
+        # the instant is asked for again, because a lease runs from when the run was taken and not from when the pass began: reclaiming, pruning and materializing are round trips to the store, and a run started on a lease those already spent half of is one the next reclaim takes back while it is still working
+        claimed = await self.app.store.claim(self.name, self.queues, self.free, self.lease, now())
 
         for run in claimed:
             self.spawn(run)
@@ -212,14 +213,20 @@ class Worker:
 
         await self.announce(self.starting, run)
 
+        # looked up before anything is called, and never caught around the call: `UnknownTask` means this worker does not declare the name, which only the lookup can say. a handler raising it is a handler with a bug, and reading that as a rolling deploy hands the run back with the attempt given back — for ever, at every poll, repeating whatever the handler did before it raised
         try:
-            result = await self.call(run)
-        except asyncio.CancelledError:
-            # cancellation is the shutdown asking, and swallowing it would leave a worker that cannot be stopped
-            raise
+            handler = self.app.task_for(run.name).handler
         except UnknownTask as error:
             # nothing was attempted: the name belongs to the code beside this worker, which is what a rolling deploy is. failing it here destroys a run that is perfectly good, and `max_attempts` is one by default — so this one never counts against it
             await self.broke(run, error, started, await self.release(run, error))
+
+            return
+
+        try:
+            result = await self.call(run, handler)
+        except asyncio.CancelledError:
+            # cancellation is the shutdown asking, and swallowing it would leave a worker that cannot be stopped
+            raise
         except PermanentError as error:
             await self.broke(run, error, started, await self.settle(run, error, retryable=False))
         except Exception as error:
@@ -250,19 +257,17 @@ class Worker:
 
         return False
 
-    async def call(self, run: Run):
+    async def call(self, run: Run, handler: Callable):
         """a handler may be a coroutine or a plain function, and a plain one runs off the loop so it never blocks the others"""
-        answer = self.settled(self.invoke(run))
+        answer = self.settled(self.invoke(handler, run.payload))
 
         if run.timeout is None:
             return await answer
 
         return await asyncio.wait_for(answer, timeout=run.timeout)
 
-    def invoke(self, run: Run):
-        handler = self.app.task_for(run.name).handler
-
-        return handler(**run.payload) if inspect.iscoroutinefunction(handler) else asyncio.to_thread(handler, **run.payload)
+    def invoke(self, handler: Callable, payload: dict):
+        return handler(**payload) if inspect.iscoroutinefunction(handler) else asyncio.to_thread(handler, **payload)
 
     async def settled(self, answer):
         """a callable object with an async `__call__`, or a decorator whose wrapper is plain, does not look like a coroutine function and still answers a coroutine — awaiting only the thread would close the run as done with the work never started"""

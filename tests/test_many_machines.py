@@ -1,5 +1,6 @@
 """the fleet, for real: separate processes with separate interpreters against one database, which is what ten containers are"""
 
+import json
 import os
 import subprocess
 import sys
@@ -23,23 +24,24 @@ ROOT = Path(__file__).resolve().parent.parent
 
 @pytest_asyncio.fixture
 async def fleet(tmp_path):
-    database, output = str(tmp_path / "fleet.db"), tmp_path / "done"
+    url, output = f"sqlite+aiosqlite:///{tmp_path / 'fleet.db'}", tmp_path / "done"
     output.mkdir()
 
-    await prepare(database)
-    app, engine = build_queue(database, str(output))
+    await prepare(url)
+    app, closing = build_queue(url, str(output))
 
-    yield app, database, output
+    yield app, url, output
 
-    await engine.dispose()
+    await closing()
 
 
-def start_machines(database: str, output: Path, count: int, seconds: float = SECONDS) -> list:
+def start_machines(url: str, output: Path, count: int, seconds: float = SECONDS) -> list:
     """the output of every machine is kept, so one that never starts says why instead of failing in silence"""
     environment = os.environ | {"PYTHONPATH": str(ROOT)}
     logs = [(output.parent / f"machine-{index}.log").open("w") for index in range(count)]
+    settings = {"url": url, "output": str(output), "seconds": seconds, "attempts": 1, "lease": 60.0, "concurrency": 4}
 
-    return [(subprocess.Popen([sys.executable, "-m", "tests.machine", database, str(output), str(seconds)], cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT), log) for log in logs]
+    return [(subprocess.Popen([sys.executable, "-m", "tests.machine", json.dumps(settings)], cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT), log) for log in logs]
 
 
 def told(output: Path) -> str:
@@ -59,12 +61,12 @@ def executions(output: Path, prefix: str) -> list[str]:
 
 
 async def test_four_machines_share_the_work_and_none_of_them_repeats_it(fleet):
-    app, database, output = fleet
+    app, url, output = fleet
 
     for marker in range(RUNS):
         await app.enqueue("record", marker=f"run-{marker:03d}")
 
-    wait_for_all(start_machines(database, output, MACHINES), output)
+    wait_for_all(start_machines(url, output, MACHINES), output)
 
     done = executions(output, "run-")
     markers = {name.split(".")[0] for name in done}
@@ -78,9 +80,9 @@ async def test_four_machines_share_the_work_and_none_of_them_repeats_it(fleet):
 
 
 async def test_a_recurring_job_fires_once_a_slot_across_machines(fleet):
-    app, database, output = fleet
+    app, url, output = fleet
 
-    wait_for_all(start_machines(database, output, MACHINES), output)
+    wait_for_all(start_machines(url, output, MACHINES), output)
 
     ticks = executions(output, "tick.")
 
@@ -89,11 +91,11 @@ async def test_a_recurring_job_fires_once_a_slot_across_machines(fleet):
 
 
 async def test_a_machine_that_dies_mid_job_leaves_the_run_for_the_next_one(fleet):
-    app, database, output = fleet
+    app, url, output = fleet
 
     await app.enqueue("record", marker="interrupted")
 
-    machines = start_machines(database, output, 1, seconds=PATIENCE)
+    machines = start_machines(url, output, 1, seconds=PATIENCE)
     dying, log = machines[0]
 
     await wait_until(lambda: executions(output, "interrupted"))

@@ -14,10 +14,14 @@ class RetryPolicy(StrEnum):
 
 def delay_for(policy: RetryPolicy, base: float, attempt: int, jitter: float = 0.0, ceiling: float = 3600.0) -> float:
     """how long the attempt that just failed waits before the next one, in seconds, and never longer than the ceiling"""
-    return min(growth_for(policy, base, attempt, jitter), ceiling)
+    if policy != RetryPolicy.EXPONENTIAL_JITTER:
+        return min(growth_for(policy, base, attempt), ceiling)
+
+    # the growth is held under the ceiling before the draw and never cut down to it afterwards: every run of a herd that has doubled its way past the ceiling works out the very same wait, so capping the drawn delay hands back whole the herd this policy exists to break up. drawn under the ceiling the wait still lands within it, and still lands somewhere different for each of them
+    return min(growth_for(policy, base, attempt), ceiling / (1 + jitter)) * (1 + random.uniform(0, jitter))
 
 
-def growth_for(policy: RetryPolicy, base: float, attempt: int, jitter: float) -> float:
+def growth_for(policy: RetryPolicy, base: float, attempt: int) -> float:
     if policy == RetryPolicy.FIXED:
         return base
 
@@ -25,10 +29,4 @@ def growth_for(policy: RetryPolicy, base: float, attempt: int, jitter: float) ->
         return base * attempt
 
     # the first attempt waits the base delay, and every one after it doubles
-    exponential = base * (2 ** min(attempt - 1, MAX_DOUBLINGS))
-
-    if policy == RetryPolicy.EXPONENTIAL:
-        return exponential
-
-    # spread by a drawn fraction and never by a fixed one: ten thousand runs that failed on the same dead dependency work out the same delay from the same numbers, and a multiplier they all share hands the herd back whole
-    return exponential * (1 + random.uniform(0, jitter))
+    return base * (2 ** min(attempt - 1, MAX_DOUBLINGS))

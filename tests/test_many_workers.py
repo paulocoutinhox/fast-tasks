@@ -12,6 +12,11 @@ from tests.conftest import wait_until
 RUNS = 40
 WORKERS = 10
 
+# a batch abandoned every round, so every pass of every worker has expired leases to take back while the others are claiming. the numbers are its own, and the poll is slower than everywhere else here, because every one of these is a round trip and a traced run is an order of magnitude slower than the run that chose them
+CONTENDERS = 6
+ROUNDS = 5
+BATCH = 12
+
 
 async def test_every_run_is_executed_exactly_once_however_many_workers_reach_for_it(app):
     executed = []
@@ -58,6 +63,40 @@ async def test_ten_workers_beating_at_once_write_one_run_a_slot(store):
         await worker.drain()
 
     assert await store.count() == 1, "one slot, one run, however many of them wrote it"
+
+
+async def test_leases_running_out_under_a_fleet_never_hand_one_run_to_two_workers(app):
+    """the reclaim of one worker and the claim of another meet on the same rows, which is where a run gets handed out twice. it is the one interleaving nothing else in the suite puts under load: a claim racing a claim is settled by one conditional write, and a claim racing a reclaim is settled by two"""
+    executed = []
+
+    @app.task("record", max_attempts=5, retry_delay=0)
+    async def record(marker):
+        executed.append(marker)
+
+    workers = [Worker(app, concurrency=3, poll=0.05) for _ in range(CONTENDERS)]
+    polling = [asyncio.create_task(worker.run()) for worker in workers]
+    written = 0
+
+    for _ in range(ROUNDS):
+        for marker in range(written, written + BATCH):
+            await app.enqueue("record", marker=marker)
+
+        # taken by a machine that is already gone, so what every worker meets is a lease that ran out the moment it was written
+        await app.store.claim("a-machine-that-died", ("default",), BATCH, timedelta(seconds=-5), now())
+        written += BATCH
+
+        await asyncio.sleep(0.1)
+
+    await wait_until(lambda: len(executed) >= written)
+
+    for worker in workers:
+        worker.stop()
+
+    await asyncio.gather(*polling)
+
+    assert sorted(executed) == list(range(written)), "every run happened, and not one of them twice"
+    assert await app.count(status=RunStatus.FAILED) == 0
+    assert await app.count(status=RunStatus.DONE) == written
 
 
 async def test_a_worker_that_dies_holding_a_run_does_not_take_it_with_him(app):

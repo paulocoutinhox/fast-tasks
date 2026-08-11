@@ -8,11 +8,12 @@ import pytest
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from fast_tasks.app import occurrence_key
 from fast_tasks.clock import now
 from fast_tasks.errors import CronError, PermanentError, QueueError
 from fast_tasks.retry import RetryPolicy, delay_for
 from fast_tasks.run import Run, RunStatus
-from fast_tasks.store.base import RECLAIM_BATCH, WORKER_NAME_LIMIT
+from fast_tasks.store.base import KEY_LIMIT, QUEUE_LIMIT, RECLAIM_BATCH, TASK_NAME_LIMIT, WORKER_NAME_LIMIT
 from fast_tasks.task import Task
 from fast_tasks.trigger import Cron
 from fast_tasks.worker import PURGE_LIMIT, Worker, worker_name
@@ -754,7 +755,7 @@ async def test_a_run_a_pruning_already_dropped_is_not_counted_as_depth(app):
 def test_a_run_allowed_a_thousand_attempts_still_works_out_a_delay():
     """doubling is an integer that outgrows a float long before the ceiling has anything to say, and the retry raised instead of waiting"""
     assert delay_for(RetryPolicy.EXPONENTIAL, 5.0, 1100, 0.0, 3600.0) == 3600.0
-    assert delay_for(RetryPolicy.EXPONENTIAL_JITTER, 5.0, 4000, 0.5, 60.0) == 60.0
+    assert delay_for(RetryPolicy.EXPONENTIAL_JITTER, 5.0, 4000, 0.5, 60.0) <= 60.0
     assert delay_for(RetryPolicy.EXPONENTIAL, 5.0, 3, 0.0, 3600.0) == 20.0, "and the growth below the ceiling is untouched"
 
 
@@ -785,3 +786,185 @@ async def test_a_caller_that_changes_the_run_it_enqueued_does_not_change_the_row
 
     assert stored.payload == {"who": "paulo"}
     assert stored.status == RunStatus.PENDING
+
+
+async def test_a_reclaim_leaves_alone_a_run_somebody_claimed_while_it_was_waiting(app, monkeypatch):
+    """the batch of expired leases is named by a subselect the database reads once and then holds, and the update asserted nothing about those rows — so a row the statement waited on a lock for was written whatever it had since become, and a worker still working lost the run out from under it"""
+    from fast_tasks.store import sqlalchemy as backend
+
+    if not isinstance(app.store, backend.SqlAlchemyStore):
+        pytest.skip("only a database names a batch in one statement and writes it in another")
+
+    written = await app.store.add(Run(name="work", max_attempts=5))
+    working = await app.store.claim("worker-still-alive", ("default",), 1, timedelta(seconds=600), now())
+
+    assert len(working) == 1, "a live worker holds it, on a lease with ten minutes left"
+
+    # the batch a sweep already read still names this run, which is what it was before the live worker took it over
+    monkeypatch.setattr(backend, "limited", lambda condition, size: backend.runs.c.id.in_([written.id]))
+
+    assert await app.store.reclaim(now()) == 0, "no lease has run out, so there is nothing to take back"
+
+    held = await app.get(written.id)
+
+    assert held.status == RunStatus.RUNNING
+    assert held.worker == "worker-still-alive", "the run stayed with the worker that is still working on it"
+
+
+async def test_a_handler_reaching_for_a_name_that_is_not_there_is_a_handler_that_failed(app):
+    """`UnknownTask` means this worker does not declare the name, and only the lookup can say that. read off the handler instead, a task fanning out to a name nobody registered was handed back with its attempt given back — for ever, at every poll, repeating everything it did before it raised"""
+    ran = []
+
+    @app.task("fan_out", max_attempts=1, retry_delay=0)
+    async def fan_out():
+        ran.append(1)
+
+        await app.enqueue("a_name_nobody_declared")
+
+    written = await app.enqueue("fan_out")
+    worker = Worker(app, poll=0.05)
+
+    for _ in range(4):
+        await worker.run_once()
+        await worker.drain()
+
+    settled = await app.get(written.id)
+
+    assert len(ran) == 1, "the attempt was spent, instead of the side effect repeating for ever"
+    assert settled.status == RunStatus.FAILED
+    assert settled.error_type == "UnknownTask"
+    assert settled.attempts == 1
+
+
+def test_a_herd_that_doubled_its_way_past_the_ceiling_is_still_spread():
+    """the ceiling was applied to the drawn delay instead of to the growth under it, so every run that saturated it worked the very same wait out from the very same numbers — which is the herd this policy exists to break up, handed back whole"""
+    drawn = {delay_for(RetryPolicy.EXPONENTIAL_JITTER, 5.0, 40, 0.5, 60.0) for _ in range(50)}
+
+    assert len(drawn) > 1, "they were spread, and every one of them is far past the ceiling"
+    assert max(drawn) <= 60.0, "and no wait is ever longer than the ceiling"
+    assert min(drawn) >= 40.0, "and none is drawn further under it than the jitter asked for"
+
+
+async def test_the_lease_a_claim_hands_out_runs_from_the_instant_the_run_was_taken(app):
+    """the pass read the instant once and claimed with it after reclaiming, pruning and materializing — three round trips — so a slow pass handed out a lease it had already spent most of, and the next reclaim took the run back while it was still being worked"""
+    waiting = 0.3
+
+    @app.task("work")
+    async def work():
+        return None
+
+    original = type(app.store).reclaim
+
+    async def slowly(self, moment):
+        await asyncio.sleep(waiting)
+
+        return await original(self, moment)
+
+    type(app.store).reclaim = slowly
+
+    try:
+        await app.enqueue("work")
+
+        worker = Worker(app, lease=timedelta(seconds=60))
+        began = now()
+        claimed = (await worker.run_once())[0]
+
+        await worker.drain()
+    finally:
+        type(app.store).reclaim = original
+
+    assert claimed.started_at >= began + timedelta(seconds=waiting - 0.05), "the claim was made with the instant it happened, and not with the one the pass opened with"
+
+
+@pytest.mark.parametrize("options,reason", [({"name": "x" * (TASK_NAME_LIMIT + 1)}, "the name of"), ({"name": "work", "queue": "q" * (QUEUE_LIMIT + 1)}, "the queue"), ({"name": "x" * TASK_NAME_LIMIT, "every": 60}, "the key each slot")])
+def test_a_name_a_store_could_never_hold_is_refused_where_it_is_declared(app, options, reason):
+    """the worker name has been sized against the column it goes in since the beginning, and the task name, the queue and the key never were. a name past the column is a write the database refuses, and on one that is not strict a name quietly cut short — where two slots of two different minutes become one run"""
+    with pytest.raises(QueueError, match=reason):
+        app.task(**options)(lambda: None)
+
+
+def test_a_task_that_fits_every_column_it_touches_is_declared(app):
+    """the limits are the columns and not a guess at them, so the longest name a store can hold is a name that works"""
+    assert app.task("x" * TASK_NAME_LIMIT, queue="q" * QUEUE_LIMIT)(lambda: None)
+
+    # the slot key is the name and the instant, so a recurring task has less of the column to itself than a plain one
+    assert app.task("y" * (KEY_LIMIT - len(occurrence_key("", now()))), every=60)(lambda: None)
+
+
+async def test_a_key_a_store_could_never_hold_is_refused_at_the_call(app):
+    """a caller keying a run by something long — an url, a rendered template — had it cut short by the database, and the run that came back was somebody else's"""
+
+    @app.task("work")
+    async def work():
+        return None
+
+    with pytest.raises(QueueError, match="the key"):
+        await app.enqueue("work", key="k" * (KEY_LIMIT + 1))
+
+    assert await app.enqueue("work", key="k" * KEY_LIMIT), "and the longest key a store can hold is a key that works"
+
+
+async def test_the_columns_a_store_builds_are_the_limits_the_app_refuses_by(app):
+    """two numbers written down twice drift, and the day they do the app refuses what the store would have taken or takes what it will not hold"""
+    from fast_tasks.store.sqlalchemy import SqlAlchemyStore, runs
+
+    if not isinstance(app.store, SqlAlchemyStore):
+        pytest.skip("only a database sizes a column")
+
+    assert (runs.c.name.type.length, runs.c.queue.type.length, runs.c.key.type.length) == (TASK_NAME_LIMIT, QUEUE_LIMIT, KEY_LIMIT)
+    assert runs.c.worker.type.length == WORKER_NAME_LIMIT
+
+
+async def test_a_reclaim_pass_takes_one_batch_however_many_ways_a_lease_can_end(app, monkeypatch):
+    """the two halves of a sweep each took a batch of their own, so a pass over a cluster that died holding a mix of both wrote twice what the constant says one pass writes — and the constant is there to bound how long the store is held"""
+    from fast_tasks.store import sqlalchemy as backend
+
+    if not isinstance(app.store, backend.SqlAlchemyStore):
+        pytest.skip("only this store takes back what is spent and what is not in two statements")
+
+    monkeypatch.setattr(backend, "RECLAIM_BATCH", 10)
+
+    @app.task("spent", max_attempts=1)
+    async def spent():
+        return None
+
+    @app.task("work", max_attempts=5)
+    async def work():
+        return None
+
+    for _ in range(10):
+        await app.enqueue("spent")
+
+    for _ in range(5):
+        await app.enqueue("work")
+
+    await app.store.claim("a-cluster-that-died", ("default",), 15, timedelta(seconds=-1), now())
+
+    assert await app.store.reclaim(now()) == 10, "one pass took one batch, and not one of each kind"
+    assert await app.store.reclaim(now()) == 5, "and the pass after it took the rest"
+
+
+async def test_a_herd_the_database_rolled_back_does_not_come_back_in_lockstep(monkeypatch):
+    """the wait between tries was a fixed schedule every contender worked out from the same numbers, so the transactions innodb rolled back came back together, deadlocked on each other again and spent the whole budget doing it. measured against a hot queue with forty claims and a reclaim on the same rows, that left outcomes the store refused on every single run — and a refused outcome is work silently done again a lease later"""
+    from fast_tasks.store import sqlalchemy as backend
+
+    waits = []
+
+    async def instead(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(backend.asyncio, "sleep", instead)
+
+    async def deadlocking():
+        raise DBAPIError("UPDATE", {}, Exception(1213, "Deadlock found when trying to get lock"))
+
+    for _ in range(2):
+        with pytest.raises(DBAPIError):
+            await backend.under_contention(deadlocking)
+
+    mine, theirs = waits[: backend.TRIES - 1], waits[backend.TRIES - 1 :]
+
+    assert len(mine) == len(theirs) == backend.TRIES - 1
+    assert mine != theirs, "two transactions rolled back by the same deadlock do not come back at the same instants"
+    assert all(later > earlier for earlier, later in zip(mine, mine[1:])), "and each wait is longer than the one before it"
+    assert sum(mine) >= 0.6, "the budget outlasts a burst of contention instead of adding a few milliseconds and giving up on it"

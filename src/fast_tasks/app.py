@@ -5,7 +5,7 @@ from fast_tasks.clock import as_utc, now
 from fast_tasks.errors import QueueError, UnknownTask
 from fast_tasks.retry import RetryPolicy
 from fast_tasks.run import Run, RunStatus
-from fast_tasks.store.base import Store
+from fast_tasks.store.base import KEY_LIMIT, QUEUE_LIMIT, TASK_NAME_LIMIT, Store
 from fast_tasks.task import Task
 from fast_tasks.trigger import Cron, Interval, Trigger
 
@@ -13,6 +13,12 @@ from fast_tasks.trigger import Cron, Interval, Trigger
 def occurrence_key(name: str, moment: datetime) -> str:
     """what makes one slot of a recurring task a single run, computed the same way by every worker of every machine"""
     return f"{name}@{moment.isoformat()}"
+
+
+def within(value: str, limit: int, what: str) -> None:
+    """every store sizes the column it keeps a name in, and there is nothing further down that can tell a value is too long for it. a database in strict mode refuses the write, and one that is not quietly cuts the value short — which for a key is two occurrences of two different minutes ending up as one run"""
+    if len(value) > limit:
+        raise QueueError(f"{what} is {len(value)} characters and a store keeps {limit} of them, so the write is one the database refuses or quietly cuts short")
 
 
 def trigger_for(every: float | timedelta | None, cron: str | None) -> Trigger | None:
@@ -35,6 +41,13 @@ class FastTasks:
     def register(self, task: Task) -> Task:
         if task.name in self.tasks:
             raise QueueError(f"'{task.name}' is registered twice, and a name has to mean one thing")
+
+        within(task.name, TASK_NAME_LIMIT, f"the name of '{task.name}'")
+        within(task.queue, QUEUE_LIMIT, f"the queue '{task.queue}' of '{task.name}'")
+
+        # a recurring task writes its own key on every poll, so the one it would write next is what says whether it will ever fit. left to the worker, this is a task that fails on its first pass and takes that pass down with it
+        if task.trigger is not None:
+            within(occurrence_key(task.name, task.trigger.next_after(now())), KEY_LIMIT, f"the key each slot of '{task.name}' is written under")
 
         self.tasks[task.name] = task
 
@@ -75,6 +88,9 @@ class FastTasks:
 
     def build(self, task: Task, due_at: datetime, payload: dict, key: str | None, priority: int | None) -> Run:
         """the instant is settled here and never in a store: a datetime with no zone is the utc one it reads as, and three stores each deciding that for themselves is the same value naming three instants"""
+        if key is not None:
+            within(key, KEY_LIMIT, f"the key '{key}'")
+
         return Run(name=task.name, queue=task.queue, payload=payload, key=key, due_at=as_utc(due_at), max_attempts=task.max_attempts, timeout=task.timeout, retry_policy=task.retry_policy, retry_delay=task.retry_delay, max_retry_delay=task.max_retry_delay, priority=task.priority if priority is None else priority)
 
     async def store_once(self, run: Run) -> Run:

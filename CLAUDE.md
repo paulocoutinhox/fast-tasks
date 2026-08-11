@@ -150,9 +150,10 @@ are the whole of `run`, and they are what a test uses instead of sleeping.
 ```
 spawn a heartbeat task, pushing the lease every lease/HEARTBEAT_SHARE
 announce on_start
+look the name up
+  UnknownTask       → store.release    → announce on_error   (the attempt is given back)
 call the handler (coroutine directly, plain function via asyncio.to_thread), under `timeout`
   returned          → store.complete   → announce on_finish
-  UnknownTask       → store.release    → announce on_error   (the attempt is given back)
   PermanentError    → store.fail       → announce on_error
   Exception         → retry_later or fail, by the policy → announce on_error
   SystemExit / KeyboardInterrupt → store.fail → announce on_error
@@ -160,10 +161,11 @@ call the handler (coroutine directly, plain function via asyncio.to_thread), und
 ask the heartbeat to stop, and await it — never cancel it
 ```
 
-Two rules hide in there and both were bugs once:
+Three rules hide in there and all three were bugs once:
 
 - **The heartbeat is asked to stop and then awaited, never cancelled.** A command interrupted halfway leaves the connection with an answer nobody read, and whoever takes that connection next waits for a reply that already went somewhere else.
 - **An outcome the store refused is not announced.** A worker whose lease ran out no longer holds the run; announcing anyway writes that run into an audit trail twice.
+- **The lookup is outside the call, and `UnknownTask` is never caught around the handler.** Only the lookup can say this worker does not declare the name. A handler that raises it — one fanning out to a name nobody registered — is a handler with a bug, and reading that as a rolling deploy hands the run back with its attempt given back for ever, repeating on every poll everything the handler did before it raised.
 
 ### How a recurring task fires exactly once — `FastTasks.materialize`
 
@@ -204,7 +206,8 @@ There is no catch-up. A fleet that was down for an hour writes the next slot, no
 | `MAX_DOUBLINGS` | `retry.py` | 64 | past this the exponent is a number a float no longer holds, and an ambitious `max_attempts` becomes a retry that raises instead of one that waits |
 | `HORIZON` | `cron.py` | 8 × 366 | a leap day is the furthest any expression has to look, and the century that is not a leap year makes that gap eight years and not four |
 | `CONTENDED` | `store/sqlalchemy.py` | {1205, 1213} | MySQL deadlock and lock-wait timeout — the documented handling is to ask again |
-| `TRIES` / `BACKOFF` | `store/sqlalchemy.py` | 5 / 0.01 | short and growing, because the other side only needs to finish the statement it is already in |
+| `TRIES` / `BACKOFF` / `SPREAD` | `store/sqlalchemy.py` | 8 / 0.005 / 1.0 | short to begin with, doubling because contention comes in bursts, and drawn so a herd InnoDB rolled back does not come back in lockstep — measured, five linear tries left refused outcomes on every run of a hot queue |
+| `TASK_NAME_LIMIT` / `KEY_LIMIT` / `QUEUE_LIMIT` | `store/base.py` | 255 / 255 / 64 | what every store sizes those columns for, refused where the task is declared — a value past the column is a write the database refuses, or one it quietly cuts short, and two slot keys cut to the same length are one run where there should be two |
 | `PREFIX` | `store/redis.py` | `fast_tasks` | renames every key at once, so the store shares a Redis without ever meeting the application |
 
 ---
@@ -234,6 +237,7 @@ Things that are the way they are for a reason:
 - **`setup` runs `create_all` twice on failure.** `create_all` asks whether the table is there and then creates it, which is a question and a statement with a gap between them; ten replicas booting together used to leave eight of them dead on that gap. It reads no error message: with the table there the second call does nothing, and with it still missing it raises for whatever the real reason was.
 - **`under_contention`** retries a write when the database asked for it, and lets everything else through untouched. InnoDB answers a duplicate two transactions race for with a deadlock as often as with a duplicate-key error.
 - **`limited()`** puts the row limit in a derived table, because MySQL refuses a `LIMIT` directly inside an `IN`.
+- **`take_back()` asserts the state again in the update, and never trusts the batch `limited()` handed it.** The subselect is read once and then held, so a row the statement waited on a lock for is written whatever it has since become. With the condition only in the subselect, a reclaim took back a run another worker had legitimately claimed in that moment — the same run on two workers at once, which is the one thing none of this may ever do.
 - **`insert` only reads an `IntegrityError` as "the key is taken" when there is a key.** A keyless run never raced anybody for one, so swallowing that refusal would hand the caller somebody else's run.
 
 SQLite across processes needs WAL and a busy timeout — see `docs/stores.md`.
@@ -278,22 +282,25 @@ Hard constraints:
 | raised, attempts spent | failed, with the message and the class that broke |
 | raised `PermanentError` | failed **now**, however many attempts were allowed |
 | ran past its `timeout` | the worker stops waiting and treats it as a retryable failure |
-| raised `UnknownTask` | back to the queue, **and the attempt is given back** |
-| the worker died | the lease runs out; back to the queue, or failed with `LeaseExpired` |
+| carries a name this worker never declared | back to the queue, **and the attempt is given back** |
+| the worker died | the lease runs out, and the run goes back to the queue or fails with `LeaseExpired` |
 | raised `SystemExit` / `KeyboardInterrupt` | failed, and the worker keeps going |
 | was cancelled | the cancellation is passed on, and the lease brings the run back |
 
 Policies: `FIXED`, `LINEAR`, `EXPONENTIAL`, `EXPONENTIAL_JITTER`. No wait exceeds `max_retry_delay`.
 The jitter fraction is **drawn per run** — a fixed multiplier, however large, hands the herd back
-whole an hour later.
+whole an hour later. The ceiling is what the draw happens **under**, and never what the drawn delay is
+cut down to: a herd that doubled its way past the ceiling would otherwise work the very same wait out
+from the very same numbers, which is the one case the policy exists for.
 
 **A timeout stops the waiting, and only a coroutine stops the work.** Python cannot end a thread from
 outside, so a plain handler carries on to its own end while the worker has already given up on it.
 
-**`UnknownTask` is the rolling-deploy path.** The older replica meets runs the newer one enqueued for
-tasks it does not declare. The claim already spent the attempt, so handing the run back is what gives
-it back — and a run left sitting on an attempt it never used is one the first reclaim that meets it
-ends for good.
+**`UnknownTask` is the rolling-deploy path, and it belongs to the lookup and never to the handler.**
+The older replica meets runs the newer one enqueued for tasks it does not declare. The claim already
+spent the attempt, so handing the run back is what gives it back — and a run left sitting on an
+attempt it never used is one the first reclaim that meets it ends for good. A handler that raises
+`UnknownTask` itself is an ordinary failure, retried and ended by the policy like any other.
 
 ---
 
@@ -304,6 +311,7 @@ make install     # venv + the package with its development tools
 make servers     # redis on 6399, mysql on 3399, postgres on 5499
 make test        # the suite
 make coverage    # the suite with the 100% branch gate
+make stress      # many machines against every server that answers, minutes and not seconds
 make lint        # ruff check + black --check
 make format      # ruff --fix, then black — in that order
 make build       # wheel and sdist
@@ -316,6 +324,8 @@ Rules the suite enforces on itself:
 - **A test never waits without a bound.** Use `wait_until` from `tests/conftest.py`. `pytest-timeout` is set to 120s with `timeout_method = "thread"`, so a hang becomes a failure with every stack dumped.
 - **A store nobody can reach is not collected.** Memory and SQLite always run; Redis, MySQL and PostgreSQL join when their port answers. `make coverage` needs all three.
 - **Run against a real MySQL before believing anything about MySQL.** Its `DATETIME` rounding is invisible to SQLite and PostgreSQL.
+- **The stress suite is marked `stress` and left out of every ordinary run.** It is minutes rather than seconds, so a run of `make test` that included it is a run nobody waits for. Tracing costs an order of magnitude, which is why its load lives there and not in the graded suite.
+- **100% coverage is not the same as 100% of the interleavings.** Two of the worst bugs found so far were invisible to a suite already at 100%: coverage counts lines a test reached, and neither of those was a line nobody reached. What found them was load and a second connection.
 
 Files worth knowing:
 
@@ -326,8 +336,9 @@ Files worth knowing:
 | `tests/test_disasters.py` | clock skew, dying processes, handlers calling `sys.exit`, results the store cannot write |
 | `tests/test_many_machines.py` | separate interpreters against one database, which is what containers are |
 | `tests/test_many_workers.py`, `test_contention.py` | many workers in one process |
+| `tests/test_fleet_stress.py` | `make stress` — many machines and many workers against a real server, with leases running out under them the whole time |
 | `tests/test_docs.py` | the prose goes stale in silence, so this keeps it honest |
-| `tests/fleet.py`, `machine.py`, `survivor.py` | the app and the processes a fleet test spawns |
+| `tests/fleet.py`, `machine.py`, `survivor.py` | the app, the store and the processes a fleet test spawns, against whichever url it is given |
 
 **When you fix a bug, add the test that would have caught it to `tests/test_review.py`**, named after
 the behaviour and not the fix, with a docstring saying what went wrong. Then confirm it fails against
