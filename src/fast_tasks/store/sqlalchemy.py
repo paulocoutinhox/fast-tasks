@@ -97,6 +97,8 @@ runs = Table(
     Index("fast_tasks_run_lease", "status", "lease_until"),
     # what the pruning asks for, so dropping a week of settled runs is not a scan of everything ever queued
     Index("fast_tasks_run_settled", "status", "finished_at"),
+    # sqlite hands out the highest id it can see plus one, so pruning the newest settled run gives its id to the next run written. a caller holding an id from before the pruning then reads, and cancels, somebody else's run — which the sequences of postgres and the persisted counter of innodb never do
+    sqlite_autoincrement=True,
 )
 
 

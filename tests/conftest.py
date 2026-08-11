@@ -137,3 +137,8 @@ async def store(request, tmp_path):
 @pytest.fixture
 def app(store):
     return FastTasks(store)
+
+
+@pytest.fixture(scope="session")
+def differential():
+    return {}
