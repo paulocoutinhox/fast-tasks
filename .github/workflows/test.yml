@@ -1,0 +1,72 @@
+name: test
+
+on:
+  push:
+    paths-ignore: ["**.md"]
+  pull_request:
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # a pipeline that hangs is a pipeline that burns, and the suite takes under a minute
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+
+    services:
+      redis:
+        image: redis:7
+        ports: ["6399:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+      mysql:
+        image: mysql:8.4
+        ports: ["3399:3306"]
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: fast_tasks
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      postgres:
+        image: postgres:16
+        ports: ["5499:5432"]
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fast_tasks
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[sqlalchemy,redis]" pytest pytest-asyncio pytest-cov pytest-timeout ruff black aiosqlite aiomysql asyncpg cryptography
+
+      - name: lint
+        run: |
+          python -m ruff check .
+          python -m black --check .
+
+      - name: test
+        run: python -m pytest --cov

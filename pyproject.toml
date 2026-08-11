@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fast-tasks"
+version = "1.0.0"
+description = "Fast Tasks — asynchronous task queue and scheduler for Python, where one task runs on exactly one worker."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Paulo Coutinho" }]
+keywords = ["queue", "scheduler", "cron", "worker", "asyncio", "fastapi", "sqlalchemy", "redis", "tasks"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+sqlalchemy = ["sqlalchemy[asyncio]>=2.0"]
+redis = ["redis>=5.0"]
+
+[project.urls]
+Homepage = "https://github.com/paulocoutinhox/fast-tasks"
+Documentation = "https://github.com/paulocoutinhox/fast-tasks/tree/main/docs"
+Issues = "https://github.com/paulocoutinhox/fast-tasks/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fast_tasks"]
+
+[tool.black]
+line-length = 320
+target-version = ["py311"]
+skip-magic-trailing-comma = true
+
+[tool.ruff]
+line-length = 320
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+# no test runs forever: a hang becomes a failure with a traceback instead of a runner burning for hours
+timeout = 120
+
+# the thread method kills the process and dumps every stack, which is the one that works when the block is somewhere a signal never reaches
+timeout_method = "thread"
+
+[tool.coverage.run]
+branch = true
+source = ["fast_tasks"]
+concurrency = ["greenlet", "thread"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 100
+exclude_lines = ["pragma: no cover", "raise NotImplementedError", "@abstractmethod"]
