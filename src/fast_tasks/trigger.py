@@ -13,6 +13,10 @@ class Trigger:
         raise NotImplementedError
 
 
+# the finest an instant is ever kept, in every store and in the column each of them holds one in. anything under it names one slot twice and never two of them
+RESOLUTION = timedelta(microseconds=1)
+
+
 @dataclass(frozen=True)
 class Interval(Trigger):
     """every n seconds, counted from the unix epoch so every worker of every machine names the same slot"""
@@ -23,10 +27,16 @@ class Interval(Trigger):
         if self.seconds <= 0:
             raise QueueError(f"an interval of {self.seconds}s never advances")
 
-    def next_after(self, moment: datetime) -> datetime:
-        elapsed = (moment - EPOCH).total_seconds()
+        if self.span < RESOLUTION:
+            raise QueueError(f"an interval of {self.seconds}s is finer than the microsecond a store keeps an instant to, so every slot of it is the slot before it under another name")
 
-        return EPOCH + timedelta(seconds=(int(elapsed // self.seconds) + 1) * self.seconds)
+    @property
+    def span(self) -> timedelta:
+        return timedelta(seconds=self.seconds)
+
+    def next_after(self, moment: datetime) -> datetime:
+        """counted in whole slots and never in seconds: a float carries the answer back through a multiplication it cannot undo, and the slot that came out of it was the instant it was asked after — a task writing the occurrence it had already written, and never the one after"""
+        return EPOCH + self.span * ((moment - EPOCH) // self.span + 1)
 
 
 @dataclass(frozen=True)

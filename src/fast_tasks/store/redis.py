@@ -13,30 +13,58 @@ PREFIX = "fast_tasks"
 
 # what a claim does has to be one step to the server: find the highest priority due run, take it, and move it to the leases — three round trips would let a second worker in between them
 CLAIM = """
+local prefix = ARGV[6]
+local wanted = tonumber(ARGV[4])
 local taken = {}
 
+-- the levels of every queue this worker serves, gathered before any of them is walked: a queue is where a run waits and never what orders it, so serving one queue to its end first hands out an ordinary run while an urgent one waits next door
+local levels = {}
+local seen = {}
+
 for _, queue in ipairs(KEYS) do
-  local levels = redis.call('ZREVRANGE', ARGV[6] .. ':priorities:' .. queue, 0, -1)
+  for _, level in ipairs(redis.call('ZREVRANGE', prefix .. ':priorities:' .. queue, 0, -1)) do
+    if not seen[level] then
+      seen[level] = true
+      table.insert(levels, level)
+    end
+  end
+end
 
-  for _, level in ipairs(levels) do
-    if #taken >= tonumber(ARGV[4]) then break end
+table.sort(levels, function(left, right) return tonumber(left) > tonumber(right) end)
 
-    local lane = ARGV[6] .. ':queue:' .. queue .. ':' .. level
-    local ready = redis.call('ZRANGEBYSCORE', lane, '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[5]))
+for _, level in ipairs(levels) do
+  if #taken >= wanted then break end
 
-    for _, id in ipairs(ready) do
-      if #taken >= tonumber(ARGV[4]) then break end
+  -- every lane of this level, merged by when each run came due and then by which was written first, which is the order the other stores read straight out of one index
+  local ready = {}
 
-      if redis.call('ZREM', lane, id) == 1 then
-        local key = ARGV[6] .. ':run:' .. id
+  for _, queue in ipairs(KEYS) do
+    local lane = prefix .. ':queue:' .. queue .. ':' .. level
+    local due = redis.call('ZRANGEBYSCORE', lane, '-inf', ARGV[1], 'WITHSCORES', 'LIMIT', 0, tonumber(ARGV[5]))
 
-        -- a run an eviction took leaves its id in the lane, and writing the fields of a claim over nothing would build a hash that holds those fields and no run
-        if redis.call('EXISTS', key) == 1 then
-          redis.call('HSET', key, 'status', 'running', 'worker', ARGV[2], 'started_at', ARGV[1], 'lease_until', ARGV[3])
-          redis.call('HINCRBY', key, 'attempts', 1)
-          redis.call('ZADD', ARGV[6] .. ':leased', tonumber(ARGV[3]), id)
-          table.insert(taken, id)
-        end
+    for index = 1, #due, 2 do
+      table.insert(ready, {id = due[index], due_at = tonumber(due[index + 1]), lane = lane})
+    end
+  end
+
+  table.sort(ready, function(left, right)
+    if left.due_at ~= right.due_at then return left.due_at < right.due_at end
+
+    return tonumber(left.id) < tonumber(right.id)
+  end)
+
+  for _, entry in ipairs(ready) do
+    if #taken >= wanted then break end
+
+    if redis.call('ZREM', entry.lane, entry.id) == 1 then
+      local key = prefix .. ':run:' .. entry.id
+
+      -- a run an eviction took leaves its id in the lane, and writing the fields of a claim over nothing would build a hash that holds those fields and no run
+      if redis.call('EXISTS', key) == 1 then
+        redis.call('HSET', key, 'status', 'running', 'worker', ARGV[2], 'started_at', ARGV[1], 'lease_until', ARGV[3])
+        redis.call('HINCRBY', key, 'attempts', 1)
+        redis.call('ZADD', prefix .. ':leased', tonumber(ARGV[3]), entry.id)
+        table.insert(taken, entry.id)
       end
     end
   end

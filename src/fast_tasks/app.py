@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from fast_tasks.clock import as_utc, now
@@ -13,6 +13,10 @@ from fast_tasks.trigger import Cron, Interval, Trigger
 def occurrence_key(name: str, moment: datetime) -> str:
     """what makes one slot of a recurring task a single run, computed the same way by every worker of every machine"""
     return f"{name}@{moment.isoformat()}"
+
+
+# the widest instant a slot is ever named for, which is what a key is measured against. an interval of half a second lands on microseconds every other slot where one on the minute never does, so the slot a task wants next says nothing about the longest key it will come to write
+WIDEST_SLOT = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
 
 
 def within(value: str, limit: int, what: str) -> None:
@@ -45,9 +49,9 @@ class FastTasks:
         within(task.name, TASK_NAME_LIMIT, f"the name of '{task.name}'")
         within(task.queue, QUEUE_LIMIT, f"the queue '{task.queue}' of '{task.name}'")
 
-        # a recurring task writes its own key on every poll, so the one it would write next is what says whether it will ever fit. left to the worker, this is a task that fails on its first pass and takes that pass down with it
+        # a recurring task writes its own key on every poll, so the longest one it will ever write is what says whether it fits. left to the worker, this is a task whose every pass raises before anything is claimed, on every worker of the fleet, for as long as the deployment lives
         if task.trigger is not None:
-            within(occurrence_key(task.name, task.trigger.next_after(now())), KEY_LIMIT, f"the key each slot of '{task.name}' is written under")
+            within(occurrence_key(task.name, WIDEST_SLOT), KEY_LIMIT, f"the key each slot of '{task.name}' is written under")
 
         self.tasks[task.name] = task
 

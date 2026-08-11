@@ -22,7 +22,8 @@ await worker.run()
 | `name` | who it says it is, drawn from host, process and a random tail when left out |
 
 A worker that could never work is refused where it is written: a poll of zero is not a wait, a
-concurrency of zero never takes anything, and a lease of zero has already run out. Each of those
+concurrency of zero never takes anything, a lease of zero has already run out, and a worker serving no
+queues claims nothing while there is nothing in the queue that would ever explain why. Each of those
 fails quietly rather than loudly when it is only checked at run time.
 
 ## 🧹 What is over is pruned

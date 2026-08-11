@@ -10,7 +10,7 @@ import pytest_asyncio
 
 from fast_tasks.run import RunStatus
 from tests.conftest import wait_until
-from tests.fleet import build_queue, prepare
+from tests.fleet import QUEUES, build_queue, prepare
 
 MACHINES = 4
 RUNS = 30
@@ -39,7 +39,7 @@ def start_machines(url: str, output: Path, count: int, seconds: float = SECONDS)
     """the output of every machine is kept, so one that never starts says why instead of failing in silence"""
     environment = os.environ | {"PYTHONPATH": str(ROOT)}
     logs = [(output.parent / f"machine-{index}.log").open("w") for index in range(count)]
-    settings = {"url": url, "output": str(output), "seconds": seconds, "attempts": 1, "lease": 60.0, "concurrency": 4}
+    settings = {"url": url, "output": str(output), "seconds": seconds, "attempts": 1, "lease": 60.0, "concurrency": 4, "queues": list(QUEUES)}
 
     return [(subprocess.Popen([sys.executable, "-m", "tests.machine", json.dumps(settings)], cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT), log) for log in logs]
 

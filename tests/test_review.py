@@ -8,14 +8,14 @@ import pytest
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from fast_tasks.app import occurrence_key
-from fast_tasks.clock import now
+from fast_tasks.app import WIDEST_SLOT, occurrence_key
+from fast_tasks.clock import EPOCH, now
 from fast_tasks.errors import CronError, PermanentError, QueueError
 from fast_tasks.retry import RetryPolicy, delay_for
 from fast_tasks.run import Run, RunStatus
 from fast_tasks.store.base import KEY_LIMIT, QUEUE_LIMIT, RECLAIM_BATCH, TASK_NAME_LIMIT, WORKER_NAME_LIMIT
 from fast_tasks.task import Task
-from fast_tasks.trigger import Cron
+from fast_tasks.trigger import Cron, Interval
 from fast_tasks.worker import PURGE_LIMIT, Worker, worker_name
 
 from .conftest import wait_until
@@ -887,8 +887,8 @@ def test_a_task_that_fits_every_column_it_touches_is_declared(app):
     """the limits are the columns and not a guess at them, so the longest name a store can hold is a name that works"""
     assert app.task("x" * TASK_NAME_LIMIT, queue="q" * QUEUE_LIMIT)(lambda: None)
 
-    # the slot key is the name and the instant, so a recurring task has less of the column to itself than a plain one
-    assert app.task("y" * (KEY_LIMIT - len(occurrence_key("", now()))), every=60)(lambda: None)
+    # the slot key is the name and the widest instant one is ever named for, so a recurring task has less of the column to itself than a plain one
+    assert app.task("y" * (KEY_LIMIT - len(occurrence_key("", WIDEST_SLOT))), every=60)(lambda: None)
 
 
 async def test_a_key_a_store_could_never_hold_is_refused_at_the_call(app):
@@ -968,3 +968,76 @@ async def test_a_herd_the_database_rolled_back_does_not_come_back_in_lockstep(mo
     assert mine != theirs, "two transactions rolled back by the same deadlock do not come back at the same instants"
     assert all(later > earlier for earlier, later in zip(mine, mine[1:])), "and each wait is longer than the one before it"
     assert sum(mine) >= 0.6, "the budget outlasts a burst of contention instead of adding a few milliseconds and giving up on it"
+
+
+async def test_priority_orders_a_claim_across_every_queue_the_worker_serves(app):
+    """the lanes were walked one queue at a time, so a worker serving two of them drained the first to its end — and handed out an ordinary run while an urgent one sat waiting next door"""
+    await app.store.add(Run(name="ordinary", queue="reports", priority=0, due_at=now() - timedelta(minutes=5)))
+    await app.store.add(Run(name="urgent", queue="email", priority=10, due_at=now()))
+
+    taken = await app.store.claim("a-worker", ("reports", "email"), 1, timedelta(seconds=60), now())
+
+    assert [run.name for run in taken] == ["urgent"], "a queue is where a run waits and never what orders it"
+
+
+async def test_the_oldest_of_a_priority_goes_first_whichever_queue_it_waits_in(app):
+    """one lane per queue answers which run of that queue is oldest, and nothing was merging the answers — so the order inside a priority was the order the queues were named in"""
+    await app.store.add(Run(name="second", queue="email", priority=5, due_at=now() - timedelta(minutes=1)))
+    await app.store.add(Run(name="first", queue="reports", priority=5, due_at=now() - timedelta(minutes=9)))
+
+    taken = await app.store.claim("a-worker", ("email", "reports"), 2, timedelta(seconds=60), now())
+
+    assert [run.name for run in taken] == ["first", "second"]
+
+
+async def test_a_recurring_task_is_measured_by_the_longest_key_it_will_ever_write(app, monkeypatch):
+    """the guard read the one slot the task wanted next, and an interval landing on microseconds every other slot goes on to write a key seven characters longer than that one — accepted where it was declared, and then refused by `build` on every pass of every worker, before anything was ever claimed"""
+    from fast_tasks import app as application
+
+    fits = "n" * (KEY_LIMIT - len(occurrence_key("", WIDEST_SLOT)))
+
+    # the guard read the clock, so which of the two keys it measured was a coin toss, and this is the toss that let the longer one through. only what is declared under it is pinned, because materializing wants a clock that moves
+    with monkeypatch.context() as clock:
+        clock.setattr(application, "now", lambda: EPOCH + timedelta(seconds=0.5))
+
+        with pytest.raises(QueueError, match="the key each slot"):
+            app.task(fits + "n", every=0.5)(lambda: None)
+
+        assert app.task(fits, every=0.5)(lambda: None), "and the longest name that fits every slot it writes is a name that works"
+
+    # both widths the interval alternates between, every one of them a key the app writes instead of raising on
+    for _ in range(4):
+        await app.materialize()
+        app.written.clear()
+
+        await asyncio.sleep(0.3)
+
+    assert await app.count() >= 2, "the slots really were written, on a name at the very edge of the column"
+
+
+@pytest.mark.parametrize("queues,reason", [((), "serving no queues"), (("q" * (QUEUE_LIMIT + 1),), "no task could ever be declared")])
+def test_a_worker_that_could_never_be_served_is_refused_where_it_is_written(app, queues, reason):
+    """a lease that has run out and a concurrency of zero were both refused, and a worker with nothing to serve was not — it came up, polled, claimed nothing and never said a word about why"""
+    with pytest.raises(QueueError, match=reason):
+        Worker(app, queues=queues)
+
+
+@pytest.mark.parametrize("seconds", [0.001, 0.01, 0.1, 0.2, 0.3, 0.7, 1.0, 2.5])
+def test_an_interval_always_names_a_slot_that_is_still_to_come(seconds):
+    """the count of whole slots was carried back through a multiplication a float cannot undo, so the slot that came out was the instant it was asked after — the occurrence already written, and never the one after it"""
+    moment = now()
+
+    for _ in range(2000):
+        due_at = Interval(seconds).next_after(moment)
+
+        assert due_at > moment, f"an interval of {seconds}s answered the instant it was asked after"
+
+        moment = due_at
+
+
+def test_an_interval_no_store_could_tell_apart_is_refused_where_it_is_written(app):
+    """every store keeps an instant to the microsecond, so a slot under one is the slot before it under another name — and counting in whole slots divides by a span that rounded to nothing"""
+    with pytest.raises(QueueError, match="finer than the microsecond"):
+        app.task("often", every=0.0000004)(lambda: None)
+
+    assert Interval(0.000001), "and the finest span a store can still tell apart is one that works"

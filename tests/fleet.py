@@ -33,18 +33,35 @@ def build_store(url: str):
     return SqlAlchemyStore(engine), engine.dispose
 
 
+# the queues a machine serves, and the task that writes into each. a claim merges the lanes of all of them, so a fleet spread this way is what says the merging holds under contention and not only in one process
+QUEUES = ("default", "email", "reports")
+
+TASKS = ("record", "record_email", "record_reports")
+
+
 def build_queue(url: str, output: str, attempts: int = 1):
     store, closing = build_store(url)
     app = FastTasks(store)
 
-    @app.task("record", max_attempts=attempts)
-    async def record(marker: str):
+    def executed(marker: str) -> None:
         # one file per execution, so a run that happened twice leaves two of them and cannot hide
         Path(output).joinpath(f"{marker}.{os.getpid()}.{uuid4().hex}").write_text(marker)
 
+    @app.task("record", max_attempts=attempts)
+    async def record(marker: str):
+        executed(marker)
+
+    @app.task("record_email", queue="email", priority=5, max_attempts=attempts)
+    async def record_email(marker: str):
+        executed(marker)
+
+    @app.task("record_reports", queue="reports", priority=10, max_attempts=attempts)
+    async def record_reports(marker: str):
+        executed(marker)
+
     @app.task("tick", every=1, max_attempts=attempts)
     async def tick():
-        Path(output).joinpath(f"tick.{os.getpid()}.{uuid4().hex}").write_text("tick")
+        executed("tick")
 
     return app, closing
 

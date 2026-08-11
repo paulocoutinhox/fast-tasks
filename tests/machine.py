@@ -15,7 +15,7 @@ async def main(settings: dict) -> None:
     # every process sets its own store up, because what that means for redis is registering the scripts this one is about to run
     await app.setup()
 
-    worker = Worker(app, concurrency=settings["concurrency"], poll=0.02, lease=timedelta(seconds=settings["lease"]))
+    worker = Worker(app, queues=tuple(settings["queues"]), concurrency=settings["concurrency"], poll=0.02, lease=timedelta(seconds=settings["lease"]))
     polling = asyncio.create_task(worker.run())
 
     try:

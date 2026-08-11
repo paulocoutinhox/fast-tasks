@@ -14,7 +14,7 @@ from fast_tasks.clock import now
 from fast_tasks.errors import PermanentError, QueueError, UnknownTask
 from fast_tasks.retry import delay_for
 from fast_tasks.run import Run
-from fast_tasks.store.base import WORKER_NAME_LIMIT
+from fast_tasks.store.base import QUEUE_LIMIT, WORKER_NAME_LIMIT
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,13 @@ class Worker:
 
         if concurrency < 1:
             raise QueueError(f"a concurrency of {concurrency} is a worker that never takes anything")
+
+        if not self.queues:
+            raise QueueError("a worker serving no queues claims nothing, and there is nothing in the queue that would ever explain why")
+
+        for queue in self.queues:
+            if len(queue) > QUEUE_LIMIT:
+                raise QueueError(f"'{queue}' is {len(queue)} characters and a queue holds {QUEUE_LIMIT}, so no task could ever be declared with it and this worker would serve an empty name for ever")
 
         if grace < 0:
             raise QueueError(f"a grace of {grace}s is not a span to wait for what is in flight")

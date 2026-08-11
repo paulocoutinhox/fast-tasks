@@ -99,6 +99,70 @@ async def test_leases_running_out_under_a_fleet_never_hand_one_run_to_two_worker
     assert await app.count(status=RunStatus.DONE) == written
 
 
+async def test_many_workers_serving_many_queues_hand_out_every_run_exactly_once(app):
+    """a claim spanning several queues reads one ordering out of several places at once, and a run named by two of them is a run two workers take. the queues are served in the order they are named and the priorities across them are not, so this is the interleaving that says the merging holds while leases run out underneath it"""
+    executed = []
+
+    for queue, priority in (("default", 0), ("email", 5), ("reports", 10)):
+
+        @app.task(f"record_{queue}", queue=queue, priority=priority, max_attempts=5, retry_delay=0)
+        async def record(marker, executed=executed):
+            executed.append(marker)
+
+    served = ("default", "email", "reports")
+    workers = [Worker(app, queues=served, concurrency=3, poll=0.05) for _ in range(CONTENDERS)]
+    polling = [asyncio.create_task(worker.run()) for worker in workers]
+    written = 0
+
+    for _ in range(ROUNDS):
+        for marker in range(written, written + BATCH):
+            await app.enqueue(f"record_{served[marker % len(served)]}", marker=marker)
+
+        # taken by a machine that is already gone, so what every worker meets is a lease that ran out the moment it was written
+        await app.store.claim("a-machine-that-died", served, BATCH, timedelta(seconds=-5), now())
+        written += BATCH
+
+        await asyncio.sleep(0.1)
+
+    await wait_until(lambda: len(executed) >= written)
+
+    for worker in workers:
+        worker.stop()
+
+    await asyncio.gather(*polling)
+
+    assert sorted(executed) == list(range(written)), "every run happened, and not one of them twice"
+    assert await app.count(status=RunStatus.FAILED) == 0
+    assert await app.count(status=RunStatus.DONE) == written
+
+
+async def test_the_urgent_run_of_any_queue_is_served_before_the_ordinary_ones(app):
+    """priority is what orders a claim and a queue is only where a run waits, so a worker holding a deep backlog on the queue it was told about first still takes the urgent one waiting behind it"""
+    order = []
+
+    @app.task("ordinary")
+    async def ordinary(marker):
+        order.append(marker)
+
+    @app.task("urgent", queue="urgent", priority=10)
+    async def urgent(marker):
+        order.append(marker)
+
+    for marker in range(20):
+        await app.enqueue("ordinary", marker=f"ordinary-{marker:02d}")
+
+    await app.enqueue("urgent", marker="urgent")
+
+    # one at a time, so what is read is the order the store hands them out and never how fast a handler was
+    worker = Worker(app, queues=("default", "urgent"), concurrency=1, poll=0.01)
+
+    while len(order) < 21:
+        await worker.run_once()
+        await worker.drain()
+
+    assert order[0] == "urgent", f"the urgent run went first, and it was served {order.index('urgent')} runs in"
+
+
 async def test_a_worker_that_dies_holding_a_run_does_not_take_it_with_him(app):
     executed = []
 

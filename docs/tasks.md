@@ -28,6 +28,10 @@ async def poll_inbox():
 whenever a given process started, so **every worker of every machine names the same slot**. That is
 what makes the next line true.
 
+They are counted in whole slots and never in seconds, so the slot a worker is handed is always one
+still to come. An interval finer than the microsecond a store keeps an instant to is refused where it
+is written: every slot of it would be the slot before it under another name.
+
 ### 📅 Run it once, at a stated time
 
 ```python
@@ -85,6 +89,13 @@ is taken and carry on. Then the run is claimed like any other — by exactly one
 
 Nothing elects a leader, because nothing has to.
 
+The name has to leave room for the instant beside it, so a recurring task is measured against the
+**longest** key it will ever write and not against the slot it happens to want next: an interval of half
+a second lands on microseconds every other slot, and those are seven characters a whole second does not
+spend. A name that would outgrow the column is refused where the task is declared, because left to the
+worker it is a pass that raises before it claims anything — on every worker, for as long as the
+deployment lives.
+
 ## 🗝️ Keys
 
 Any run may carry a key, not just a recurring one. A key is an idempotency guarantee: the second
@@ -127,3 +138,7 @@ The payload arrives as keyword arguments, so it has to survive a trip through JS
 ```python
 await app.enqueue("send_email", priority=10, to="reader@example.com")
 ```
+
+It is served before age **across every queue a worker serves**, and not one queue at a time: a queue is
+where a run waits, and never what orders it. A worker on `("reports", "email")` holding a backlog of
+reports still takes the urgent email waiting behind it.

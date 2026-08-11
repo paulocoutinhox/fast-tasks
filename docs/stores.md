@@ -75,6 +75,11 @@ What it keeps:
 the highest priority *among what is due* — two questions that one score cannot answer. The lanes are
 created on demand, so a deployment that never sets a priority has exactly one.
 
+**A claim gathers the lanes of every queue it serves before it walks any of them.** Priority is what
+orders a claim and a queue is only where a run waits, so a worker serving two of them takes the urgent
+run of the second before the ordinary ones of the first. Inside a priority the lanes are merged by
+`due_at`, which is the order the other stores read straight out of one index.
+
 `prefix` renames every key at once, which is what lets this share a Redis with an application without
 ever meeting it.
 

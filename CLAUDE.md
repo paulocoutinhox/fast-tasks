@@ -95,7 +95,7 @@ claims a run in one of them again.
 
 ### Trigger — when the next run is written
 
-- `Interval(seconds)` — slots counted **from the unix epoch**, never from process start, so every worker of every machine names the same slot.
+- `Interval(seconds)` — slots counted **from the unix epoch**, never from process start, so every worker of every machine names the same slot. Counted in **whole slots** and never in seconds: carrying the count back through a multiplication a float cannot undo answered the instant it was asked after, and a task rewriting the occurrence it already wrote never reaches the one after. An interval finer than `RESOLUTION`, the microsecond every store keeps an instant to, is refused — every slot of it is the slot before it under another name.
 - `Cron(expression)` — five POSIX fields, rounded to the minute.
 
 Both validate in `__post_init__`, so a bad trigger raises where it is declared and not on the night it
@@ -179,6 +179,12 @@ first would let a store that blinked drop that occurrence for good.
 
 There is no catch-up. A fleet that was down for an hour writes the next slot, not the sixty it missed.
 
+`register` measures the name against `WIDEST_SLOT`, the widest instant a slot is ever named for, and
+never against the one the task happens to want next. A half-second interval lands on microseconds every
+other slot, which is seven characters a whole second does not spend — so a name measured against the
+short form was accepted where it was declared and then refused by `build` on every pass of every worker,
+before anything was ever claimed.
+
 ---
 
 ## 5. Invariants that must never be broken
@@ -259,6 +265,11 @@ scripts.
 
 **One lane per priority is why priority works.** A sorted set orders by one number, and a claim needs
 the highest priority *among what is due* — two questions one score cannot answer.
+
+**A claim gathers the lanes of every queue it serves before it walks any of them**, and merges the ones
+of a priority by `due_at`. Priority orders a claim and a queue is only where a run waits: walking one
+queue to its end first handed out an ordinary run while an urgent one sat waiting next door, which is
+the ordering every other store reads straight out of one index.
 
 Every mutation is Lua, so each is one atomic step on the server: `ADD`, `CLAIM`, `RECLAIM`, `SETTLE`,
 `HEARTBEAT`, `CANCEL`, `PURGE`. A claim that read, decided and wrote in three round trips would let a
@@ -424,9 +435,10 @@ one line.
 **Validation**
 
 Anything that could never work is refused **where it is written**, not at three in the morning: a poll
-of zero, a concurrency of zero, a lease that has already run out, a cron expression that matches
-nothing, a task asking for an interval and a cron at once. Each one carries a message that says what
-was asked for and why it cannot be.
+of zero, a concurrency of zero, a lease that has already run out, a worker serving no queues or one no
+task could ever be declared with, a cron expression that matches nothing, an interval finer than the
+microsecond a store keeps, a task asking for an interval and a cron at once. Each one carries a message
+that says what was asked for and why it cannot be.
 
 **Prose in `docs/`**
 
