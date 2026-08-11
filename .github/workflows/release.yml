@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  # a version on pypi is permanent, so the suite answers for it before anything is built
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # a tag that disagrees with the version is a release published under a number nobody asked for, and pypi never lets that number be used again
+      - name: check the tag is the version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          declared=$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          test "$tagged" = "$declared" || { echo "the tag says $tagged and pyproject.toml says $declared"; exit 1; }
+
+      - name: build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      # what is published is what was checked, so the job that uploads never builds a second time
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distribution
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # the environment the trusted publisher on pypi is bound to, and the gate an approval rule hangs off
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fast-tasks
+
+    permissions:
+      # what mints the openid token pypi trades for an upload, which is why there is no api token anywhere here
+      id-token: write
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distribution
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: announce the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

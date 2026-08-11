@@ -1,6 +1,9 @@
 import random
 from enum import StrEnum
 
+# doubling past this is a wait no ceiling ever allows and a number a float no longer holds, so an ambitious `max_attempts` is a retry that raises instead of one that waits
+MAX_DOUBLINGS = 64
+
 
 class RetryPolicy(StrEnum):
     FIXED = "fixed"
@@ -22,7 +25,7 @@ def growth_for(policy: RetryPolicy, base: float, attempt: int, jitter: float) ->
         return base * attempt
 
     # the first attempt waits the base delay, and every one after it doubles
-    exponential = base * (2 ** (attempt - 1))
+    exponential = base * (2 ** min(attempt - 1, MAX_DOUBLINGS))
 
     if policy == RetryPolicy.EXPONENTIAL:
         return exponential

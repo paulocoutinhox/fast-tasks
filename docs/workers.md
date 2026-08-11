@@ -19,11 +19,11 @@ await worker.run()
 | `jitter` | at most how much of a retry delay is drawn at random on top of it, a quarter by default, and never below zero |
 | `grace` | how long a shutdown waits for what is in flight before leaving it to the lease |
 | `keep` | how long a run that is over is kept before it is pruned, a week by default, and `None` keeps everything |
+| `name` | who it says it is, drawn from host, process and a random tail when left out |
 
 A worker that could never work is refused where it is written: a poll of zero is not a wait, a
 concurrency of zero never takes anything, and a lease of zero has already run out. Each of those
 fails quietly rather than loudly when it is only checked at run time.
-| `name` | who it says it is, drawn from host, process and a random tail when left out |
 
 ## 🧹 What is over is pruned
 
@@ -68,6 +68,13 @@ waits. Together they are the whole of `run`, and they are what a test should use
 A worker names itself `host:pid:draw`. The host tells two machines apart, the pid tells two processes
 apart, and the draw covers a pid the operating system handed out again after a restart. Everything
 that decides ownership is conditional on that name.
+
+> **A name is at most `WORKER_NAME_LIMIT` characters, and the host is what gives way.** A pod is named
+> after its deployment, its namespace and its cluster, which is well past what a store keeps a worker
+> name in — and a name that does not fit is not a worker that logs a warning, it is a worker whose
+> every claim the database refuses while the process stays up and polls forever. So the host is cut to
+> fit and the draw is what still tells two machines apart. A `name` you pass yourself is refused where
+> it is written if it is longer than that.
 
 ## ⏳ Leases and a worker that dies
 

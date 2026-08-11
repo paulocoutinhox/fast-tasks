@@ -29,8 +29,10 @@ carries no error.
 | `EXPONENTIAL` | 5, 10, 20 |
 | `EXPONENTIAL_JITTER` | the above, plus a **drawn** fraction of it, up to the worker's `jitter` |
 
-**No wait is longer than `max_retry_delay`**, an hour by default. Doubling has no ceiling of its own,
-and five seconds over twenty attempts is a retry a month away — which nobody ever meant to ask for.
+**No wait is longer than `max_retry_delay`**, an hour by default, and a ceiling of zero or less is
+refused where the task is declared: it asks for a retry due before the attempt that failed, which is
+hammering rather than backing off. Doubling has no ceiling of its own, and five seconds over twenty
+attempts is a retry a month away — which nobody ever meant to ask for.
 
 Jitter matters when a shared dependency falls over: without it every run that failed in the same
 second comes back in the same second.
@@ -50,9 +52,13 @@ picks it up.
 It has to work that way because `max_attempts` is **one** by default — counting it would mean the older
 replica destroying a perfectly good run, silently, every time it got there first.
 
-> **A name nobody knows waits instead of dying**, which is the other side of that. It is not free
-> forever, though: it backs off like any other retry, up to `max_retry_delay`, so a typo settles into
-> one claim an hour and sits in the queue where an operator can see it and cancel it.
+The claim is what spends the attempt, so handing the run back is what gives it back. A run left sitting
+on an attempt it never used is a run the first reclaim that meets it ends for good, and after a deploy
+that bounced it three times a task allowed three attempts would die on its first real failure.
+
+> **A name nobody knows waits instead of dying**, which is the other side of that. It comes back at the
+> policy's first delay each time, because nothing is counting up behind it to back off from — so a typo
+> sits in the queue, asked for once every `retry_delay`, where an operator can see it and cancel it.
 
 ## 🛑 A handler that asks the process to stop
 

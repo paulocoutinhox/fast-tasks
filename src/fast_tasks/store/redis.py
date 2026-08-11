@@ -79,6 +79,9 @@ if redis.call('HGET', key, 'worker') ~= ARGV[2] or redis.call('HGET', key, 'stat
 redis.call('ZREM', ARGV[5] .. ':leased', ARGV[1])
 redis.call('HSET', key, unpack(cjson.decode(ARGV[3])))
 
+-- what the attempt just made counts for: nothing when it happened, and one back for a worker that never had anything to try
+redis.call('HINCRBY', key, 'attempts', ARGV[6])
+
 if ARGV[4] ~= '' then
   redis.call('ZADD', ARGV[5] .. ':queue:' .. redis.call('HGET', key, 'queue') .. ':' .. redis.call('HGET', key, 'priority'), tonumber(ARGV[4]), ARGV[1])
 else
@@ -235,7 +238,7 @@ class RedisStore(Store):
     async def add(self, run: Run) -> Run | None:
         """one step on the server: the key is reserved and the run is written together, so nothing can die between the two and leave a key nobody can ever use again"""
         fields = [piece for name, value in self.to_hash(run).items() if name != "id" for piece in (name, value)]
-        written = await self.scripts["add"](keys=[], args=[self.prefix, run.key or "", json.dumps(fields), run.queue, str(run.priority), run.due_at.timestamp()])
+        written = await self.scripts["add"](keys=[], args=[self.prefix, run.key or "", json.dumps(fields), run.queue, str(run.priority), stamp(run.due_at)])
 
         if written is None:
             return None
@@ -245,7 +248,7 @@ class RedisStore(Store):
         return run
 
     async def claim(self, worker: str, queues: tuple[str, ...], limit: int, lease: timedelta, moment: datetime) -> list[Run]:
-        taken = await self.scripts["claim"](keys=list(queues), args=[moment.timestamp(), worker, (moment + lease).timestamp(), limit, limit * CLAIM_SPREAD, self.prefix])
+        taken = await self.scripts["claim"](keys=list(queues), args=[stamp(moment), worker, stamp(moment + lease), limit, limit * CLAIM_SPREAD, self.prefix])
 
         if not taken:
             return []
@@ -257,30 +260,37 @@ class RedisStore(Store):
 
             held = await pipe.execute()
 
-        return [self.to_run({key.decode(): value.decode() for key, value in stored.items()}) for stored in held]
+        # an eviction between the script and this read leaves nothing to build a run out of, and the lease is what brings that one back
+        return [self.to_run({key.decode(): value.decode() for key, value in stored.items()}) for stored in held if stored]
 
-    async def settle(self, run_id, worker: str, values: dict, due_at: datetime | None) -> bool:
+    async def settle(self, run_id, worker: str, values: dict, due_at: datetime | None, attempts: int) -> bool:
         flat = [piece for pair in values.items() for piece in pair]
 
-        return await self.scripts["settle"](keys=[], args=[run_id, worker, json.dumps(flat), stamp(due_at), self.prefix]) == 1
+        return await self.scripts["settle"](keys=[], args=[run_id, worker, json.dumps(flat), stamp(due_at), self.prefix, attempts]) == 1
 
     async def heartbeat(self, run_id, worker: str, lease: timedelta, moment: datetime) -> bool:
-        return await self.scripts["heartbeat"](keys=[], args=[run_id, worker, (moment + lease).timestamp(), self.prefix]) == 1
+        return await self.scripts["heartbeat"](keys=[], args=[run_id, worker, stamp(moment + lease), self.prefix]) == 1
 
     async def complete(self, run_id, worker: str, moment: datetime, result: dict | None) -> bool:
-        return await self.settle(run_id, worker, {"status": "done", "finished_at": stamp(moment), "result": "" if result is None else json.dumps(result), "error": "", "error_type": "", "worker": "", "lease_until": ""}, None)
+        return await self.settle(run_id, worker, {"status": "done", "finished_at": stamp(moment), "result": "" if result is None else json.dumps(result), "error": "", "error_type": "", "worker": "", "lease_until": ""}, None, 0)
 
     async def fail(self, run_id, worker: str, moment: datetime, error: str, error_type: str) -> bool:
-        return await self.settle(run_id, worker, {"status": "failed", "finished_at": stamp(moment), "error": error, "error_type": error_type, "worker": "", "lease_until": ""}, None)
+        return await self.settle(run_id, worker, {"status": "failed", "finished_at": stamp(moment), "error": error, "error_type": error_type, "worker": "", "lease_until": ""}, None, 0)
+
+    def requeued(self, due_at: datetime, error: str, error_type: str) -> dict:
+        return {"status": "pending", "due_at": stamp(due_at), "error": error, "error_type": error_type, "worker": "", "lease_until": "", "started_at": ""}
 
     async def retry_later(self, run_id, worker: str, due_at: datetime, error: str, error_type: str) -> bool:
-        return await self.settle(run_id, worker, {"status": "pending", "due_at": stamp(due_at), "error": error, "error_type": error_type, "worker": "", "lease_until": "", "started_at": ""}, due_at)
+        return await self.settle(run_id, worker, self.requeued(due_at, error, error_type), due_at, 0)
+
+    async def release(self, run_id, worker: str, due_at: datetime, error: str, error_type: str) -> bool:
+        return await self.settle(run_id, worker, self.requeued(due_at, error, error_type), due_at, -1)
 
     async def reclaim(self, moment: datetime) -> int:
-        return await self.scripts["reclaim"](keys=[], args=[moment.timestamp(), self.prefix, RECLAIM_BATCH])
+        return await self.scripts["reclaim"](keys=[], args=[stamp(moment), self.prefix, RECLAIM_BATCH])
 
     async def purge(self, before: datetime, limit: int) -> int:
-        return await self.scripts["purge"](keys=[], args=[before.timestamp(), self.prefix, limit])
+        return await self.scripts["purge"](keys=[], args=[stamp(before), self.prefix, limit])
 
     async def cancel(self, run_id, moment: datetime) -> bool:
         return await self.scripts["cancel"](keys=[], args=[run_id, stamp(moment), self.prefix]) == 1
@@ -300,10 +310,13 @@ class RedisStore(Store):
         found = 0
 
         async for name in self.client.scan_iter(match=f"{self.prefix}:run:*"):
-            stored = await self.client.hmget(name, "status", "queue")
-            held = [piece.decode() if piece else "" for piece in stored]
+            held, queued = await self.client.hmget(name, "status", "queue")
 
-            if (status is None or held[0] == status.value) and (queue is None or held[1] == queue):
+            # a pruning walking beside this drops the hash while the scan still names it, and a run that is already gone is not depth
+            if held is None:
+                continue
+
+            if (status is None or held.decode() == status.value) and (queue is None or queued.decode() == queue):
                 found += 1
 
         return found

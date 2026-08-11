@@ -14,6 +14,7 @@ from fast_tasks.clock import now
 from fast_tasks.errors import PermanentError, QueueError, UnknownTask
 from fast_tasks.retry import delay_for
 from fast_tasks.run import Run
+from fast_tasks.store.base import WORKER_NAME_LIMIT
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,10 @@ PURGE_LIMIT = 1000
 
 def worker_name() -> str:
     """a worker is told apart from every other one anywhere: the host names the machine, the pid names the process, and the draw covers a pid the system handed out again"""
-    return f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
+    tail = f":{os.getpid()}:{uuid4().hex[:8]}"
+
+    # a pod is named after its deployment, its namespace and its cluster, which is long past what a store keeps a worker name in — and the draw is what tells two machines apart once the domain is cut off the end
+    return socket.gethostname()[: WORKER_NAME_LIMIT - len(tail)] + tail
 
 
 class Worker:
@@ -64,6 +68,9 @@ class Worker:
 
         if keep is not None and keep.total_seconds() < 0:
             raise QueueError(f"keeping a run for {keep.total_seconds()}s asks for what is over to be dropped before it is over, which is all of it")
+
+        if len(self.name) > WORKER_NAME_LIMIT:
+            raise QueueError(f"a name of {len(self.name)} characters does not fit the {WORKER_NAME_LIMIT} a store keeps for one, and a claim the database refuses is a worker that polls forever and takes nothing")
 
         # drawn, so ten workers coming up together do not all reach for the same rows in the same instant — the same reason a retry delay is drawn
         self.purged: float | None = monotonic() - random.uniform(0, PURGE_EVERY)
@@ -264,8 +271,8 @@ class Worker:
         return await outcome if inspect.isawaitable(outcome) else outcome
 
     async def release(self, run: Run, error: Exception) -> bool | None:
-        """hands a run back to the queue whatever its attempts say, because this worker never had anything to try"""
-        taken = await self.app.store.retry_later(run.id, self.name, now() + timedelta(seconds=self.waiting(run)), str(error), type(error).__name__)
+        """hands a run back to the queue with the attempt given back, because this worker never had anything to try — and a spent attempt is what a reclaim reads as a run with nothing left"""
+        taken = await self.app.store.release(run.id, self.name, now() + timedelta(seconds=self.waiting(run)), str(error), type(error).__name__)
 
         return True if self.recorded(run, taken) else None
 

@@ -9,6 +9,9 @@ CLAIM_SPREAD = 5
 # how many expired leases one pass takes back: a whole cluster dying expires everything it held at once, and one statement over all of it is a transaction that holds the store while every other worker waits on it
 RECLAIM_BATCH = 500
 
+# the longest a worker may be called, which is what every store sizes the column it keeps that name in. a pod is named after its deployment and its namespace, and a name that does not fit is a worker whose every claim the database refuses
+WORKER_NAME_LIMIT = 128
+
 
 class Store(ABC):
     """where runs live. every method that changes a run is conditional on the state that run was in, which is what makes two workers safe without a lock anywhere"""
@@ -39,7 +42,11 @@ class Store(ABC):
 
     @abstractmethod
     async def retry_later(self, run_id, worker: str, due_at: datetime, error: str, error_type: str) -> bool:
-        """puts a run this worker holds back in the queue, due when the policy says"""
+        """puts a run this worker holds back in the queue, due when the policy says, with the attempt it just spent standing"""
+
+    @abstractmethod
+    async def release(self, run_id, worker: str, due_at: datetime, error: str, error_type: str) -> bool:
+        """puts a run this worker holds back in the queue and gives the attempt back with it, for a worker that never had anything to try"""
 
     @abstractmethod
     async def reclaim(self, moment: datetime) -> int:

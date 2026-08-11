@@ -2,10 +2,15 @@ name: test
 
 on:
   push:
+    # branches and never tags, because a tag is the release, and the release calls this workflow itself
+    branches: ["**"]
     paths-ignore: ["**.md"]
   pull_request:
     paths-ignore: ["**.md"]
   workflow_dispatch:
+
+  # the release calls this one rather than repeating it, so nothing reaches pypi that the suite has not answered for
+  workflow_call:
 
 jobs:
   test:

@@ -27,9 +27,11 @@ class MemoryStore(Store):
                 return None
 
             run.id = next(self.sequence)
-            self.runs[run.id] = run
 
-            return deepcopy(run)
+            # the store keeps a copy of its own, because a caller changing the run it enqueued must never change the row
+            self.runs[run.id] = deepcopy(run)
+
+            return run
 
     def claimable(self, run: Run, queues: tuple[str, ...], moment: datetime) -> bool:
         return run.status == RunStatus.PENDING and run.queue in queues and run.due_at <= moment
@@ -103,6 +105,13 @@ class MemoryStore(Store):
             return True
 
     async def retry_later(self, run_id, worker: str, due_at: datetime, error: str, error_type: str) -> bool:
+        return await self.requeue(run_id, worker, due_at, error, error_type, 0)
+
+    async def release(self, run_id, worker: str, due_at: datetime, error: str, error_type: str) -> bool:
+        return await self.requeue(run_id, worker, due_at, error, error_type, -1)
+
+    async def requeue(self, run_id, worker: str, due_at: datetime, error: str, error_type: str, attempts: int) -> bool:
+        """back in the queue, with `attempts` added to what the run has spent: nothing for an attempt that happened, and one back for a worker that never had anything to try"""
         async with self.guard:
             run = self.held(run_id, worker)
 
@@ -111,6 +120,7 @@ class MemoryStore(Store):
 
             run.status = RunStatus.PENDING
             run.due_at = due_at
+            run.attempts += attempts
             run.error = error
             run.error_type = error_type
             run.worker = None

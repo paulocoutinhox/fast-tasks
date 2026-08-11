@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from fast_tasks.clock import as_utc, naive_utc
 from fast_tasks.retry import RetryPolicy
 from fast_tasks.run import SETTLED, Run, RunStatus
-from fast_tasks.store.base import CLAIM_SPREAD, RECLAIM_BATCH, Store
+from fast_tasks.store.base import CLAIM_SPREAD, RECLAIM_BATCH, WORKER_NAME_LIMIT, Store
 
 # the store keeps its own metadata, so building its table never touches a table of the application around it
 metadata = MetaData()
@@ -80,7 +80,7 @@ runs = Table(
     Column("retry_policy", String(32), nullable=False, default=RetryPolicy.EXPONENTIAL.value),
     Column("retry_delay", Float, nullable=False, default=5.0),
     Column("max_retry_delay", Float, nullable=False, default=3600.0),
-    Column("worker", String(64), nullable=True),
+    Column("worker", String(WORKER_NAME_LIMIT), nullable=True),
     Column("lease_until", UtcDateTime, nullable=True),
     Column("created_at", UtcDateTime, nullable=False),
     Column("started_at", UtcDateTime, nullable=True),
@@ -174,8 +174,11 @@ class SqlAlchemyStore(Store):
                 written = await session.execute(runs.insert().values(**to_values(run)))
                 await session.commit()
             except IntegrityError:
-                # the key is taken, which is exactly what a second worker writing the same occurrence is supposed to hit
                 await session.rollback()
+
+                # the key is taken, which is exactly what a second worker writing the same occurrence is supposed to hit. a run with no key never raced anybody for one, so what the database refused there is a real failure and swallowing it hands the caller somebody else's run
+                if run.key is None:
+                    raise
 
                 return None
 
@@ -240,8 +243,14 @@ class SqlAlchemyStore(Store):
     async def fail(self, run_id, worker: str, moment: datetime, error: str, error_type: str) -> bool:
         return await self.write(self.holding(run_id, worker), {"status": RunStatus.FAILED.value, "finished_at": moment, "error": error, "error_type": error_type, "worker": None, "lease_until": None})
 
+    def requeued(self, due_at: datetime, error: str, error_type: str) -> dict:
+        return {"status": RunStatus.PENDING.value, "due_at": due_at, "error": error, "error_type": error_type, "worker": None, "lease_until": None, "started_at": None}
+
     async def retry_later(self, run_id, worker: str, due_at: datetime, error: str, error_type: str) -> bool:
-        return await self.write(self.holding(run_id, worker), {"status": RunStatus.PENDING.value, "due_at": due_at, "error": error, "error_type": error_type, "worker": None, "lease_until": None, "started_at": None})
+        return await self.write(self.holding(run_id, worker), self.requeued(due_at, error, error_type))
+
+    async def release(self, run_id, worker: str, due_at: datetime, error: str, error_type: str) -> bool:
+        return await self.write(self.holding(run_id, worker), self.requeued(due_at, error, error_type) | {"attempts": runs.c.attempts - 1})
 
     async def reclaim(self, moment: datetime) -> int:
         """what a dead worker left behind: the run goes back to the queue, unless its attempts are spent and there is nothing left to try"""

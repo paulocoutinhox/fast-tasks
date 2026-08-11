@@ -5,17 +5,17 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from fast_tasks.clock import now
 from fast_tasks.errors import CronError, PermanentError, QueueError
 from fast_tasks.retry import RetryPolicy, delay_for
 from fast_tasks.run import Run, RunStatus
-from fast_tasks.store.base import RECLAIM_BATCH
+from fast_tasks.store.base import RECLAIM_BATCH, WORKER_NAME_LIMIT
 from fast_tasks.task import Task
 from fast_tasks.trigger import Cron
-from fast_tasks.worker import PURGE_LIMIT, Worker
+from fast_tasks.worker import PURGE_LIMIT, Worker, worker_name
 
 from .conftest import wait_until
 
@@ -132,7 +132,7 @@ def test_a_worker_that_could_never_work_is_refused_where_it_is_written(app, opti
         Worker(app, **options)
 
 
-@pytest.mark.parametrize("options,reason", [({"max_attempts": 0}, "at least once"), ({"timeout": 0}, "before it starts"), ({"retry_delay": -1}, "never negative")])
+@pytest.mark.parametrize("options,reason", [({"max_attempts": 0}, "at least once"), ({"timeout": 0}, "before it starts"), ({"retry_delay": -1}, "never negative"), ({"max_retry_delay": 0}, "hammers instead of backing off"), ({"max_retry_delay": -5}, "hammers instead of backing off")])
 def test_a_task_that_could_never_run_is_refused_where_it_is_declared(app, options, reason):
     with pytest.raises(QueueError, match=reason):
         app.task("broken", **options)(lambda: None)
@@ -462,6 +462,7 @@ async def test_no_ending_the_store_would_not_take_is_announced_as_one_it_took(ap
 
     worker.app.store.fail = refused
     worker.app.store.retry_later = refused
+    worker.app.store.release = refused
 
     await worker.run_once()
     await wait_until(lambda: worker.free == worker.concurrency)
@@ -647,3 +648,140 @@ async def test_a_timeout_stops_the_waiting_and_only_a_coroutine_stops_the_work(a
 
     assert ran.count("started") == 2, "the worker gave up on the first and started the attempt after it"
     assert ran.count("finished anyway") == 2, "and neither copy was stopped, which is what a timeout on a plain handler means"
+
+
+async def test_a_worker_on_a_machine_with_a_long_name_can_still_claim_anything(app):
+    """a pod is named after its deployment, its namespace and its cluster, and a name past what the column holds is a worker whose every claim the database refuses — it polls forever and takes nothing"""
+    assert len(worker_name()) <= WORKER_NAME_LIMIT, "the name a worker gives itself always fits"
+
+    @app.task("work")
+    async def work():
+        return None
+
+    await app.enqueue("work")
+
+    longest = Worker(app, name="x" * WORKER_NAME_LIMIT)
+
+    assert len(await longest.app.store.claim(longest.name, ("default",), 1, timedelta(seconds=60), now())) == 1, "the store took the longest name a worker may have"
+
+    with pytest.raises(QueueError, match="does not fit"):
+        Worker(app, name="x" * (WORKER_NAME_LIMIT + 1))
+
+
+async def test_a_name_this_worker_never_heard_of_costs_the_run_no_attempt(app):
+    """`max_attempts` is one by default, so a rolling deploy that spent the attempt left the run to be destroyed by the first reclaim that met it"""
+    written = await app.store.add(Run(name="from_the_future", max_attempts=1))
+
+    worker = Worker(app, poll=0.05)
+    await worker.run_once()
+    await wait_until(lambda: worker.free == worker.concurrency)
+
+    settled = await app.get(written.id)
+
+    assert settled.status == RunStatus.PENDING
+    assert settled.attempts == 0, "the attempt it never had is given back"
+    assert await app.store.reclaim(now() + timedelta(hours=1)) == 0, "so nothing is left for a reclaim to give up on"
+    assert (await app.get(written.id)).status == RunStatus.PENDING, "and the run is still there for the replica that knows the name"
+
+
+async def test_a_run_evicted_between_the_claim_and_the_read_does_not_end_the_pass(app):
+    """the script that claims checks the run is still there, and the read after it did not — one evicted hash raised out of the whole pass and the runs beside it were never started"""
+    from fast_tasks.store.redis import RedisStore
+
+    if not isinstance(app.store, RedisStore):
+        pytest.skip("only redis keeps the run and the lane it is queued in as two separate things")
+
+    @app.task("work")
+    async def work():
+        return None
+
+    written = await app.enqueue("work")
+    claiming = app.store.scripts["claim"]
+
+    async def evicting(**arguments):
+        taken = await claiming(**arguments)
+
+        # the eviction lands after the script took the run and before the read that builds it
+        await app.store.client.delete(app.store.run_key(written.id))
+
+        return taken
+
+    app.store.scripts["claim"] = evicting
+
+    assert await app.store.claim("a-worker", ("default",), 10, timedelta(seconds=60), now()) == [], "nothing was handed out and nothing raised"
+
+
+async def test_a_lane_names_the_same_instant_a_run_was_written_for(app):
+    """`timestamp()` on a value with no zone reads it as the wall clock of whoever wrote it, so a run queued in one zone came due in another"""
+    from fast_tasks.store.redis import RedisStore
+
+    if not isinstance(app.store, RedisStore):
+        pytest.skip("only redis scores a queue by when a run is due")
+
+    overdue = now().replace(tzinfo=None) - timedelta(hours=1)
+    written = await app.store.add(Run(name="work", due_at=overdue))
+
+    assert await app.store.client.zscore(f"{app.store.prefix}:queue:default:0", written.id) == overdue.replace(tzinfo=timezone.utc).timestamp()
+    assert len(await app.store.claim("a-worker", ("default",), 1, timedelta(seconds=60), now())) == 1, "an hour overdue is due"
+
+
+async def test_a_run_a_pruning_already_dropped_is_not_counted_as_depth(app):
+    """a scan names what a pruning beside it has already deleted, and reading fields a hash no longer has counted a run that is gone"""
+    from fast_tasks.store.redis import RedisStore
+
+    if not isinstance(app.store, RedisStore):
+        pytest.skip("only redis counts by walking what it owns")
+
+    @app.task("work")
+    async def work():
+        return None
+
+    await app.enqueue("work")
+
+    naming = app.store.client.scan_iter
+
+    async def naming_a_ghost(**keywords):
+        async for name in naming(**keywords):
+            yield name
+
+        yield f"{app.store.prefix}:run:gone".encode()
+
+    app.store.client.scan_iter = naming_a_ghost
+
+    assert await app.count() == 1, "the one run that is there, and not the one that was dropped mid scan"
+
+
+def test_a_run_allowed_a_thousand_attempts_still_works_out_a_delay():
+    """doubling is an integer that outgrows a float long before the ceiling has anything to say, and the retry raised instead of waiting"""
+    assert delay_for(RetryPolicy.EXPONENTIAL, 5.0, 1100, 0.0, 3600.0) == 3600.0
+    assert delay_for(RetryPolicy.EXPONENTIAL_JITTER, 5.0, 4000, 0.5, 60.0) == 60.0
+    assert delay_for(RetryPolicy.EXPONENTIAL, 5.0, 3, 0.0, 3600.0) == 20.0, "and the growth below the ceiling is untouched"
+
+
+async def test_a_write_the_database_refused_for_its_own_reasons_is_not_a_key_that_was_taken(app):
+    """a run with no key never raced anybody for one, and reading every refusal as a duplicate handed the caller a run belonging to somebody else"""
+    from fast_tasks.store.sqlalchemy import SqlAlchemyStore
+
+    if not isinstance(app.store, SqlAlchemyStore):
+        pytest.skip("only a database refuses a write for reasons of its own")
+
+    somebody_else = await app.store.add(Run(name="work", payload={"who": "somebody else entirely"}))
+
+    with pytest.raises(IntegrityError):
+        await app.store_once(Run(name=None, payload={"who": "mine"}))
+
+    assert (await app.get(somebody_else.id)).payload == {"who": "somebody else entirely"}, "and the run of somebody else was never handed out as this one"
+
+
+async def test_a_caller_that_changes_the_run_it_enqueued_does_not_change_the_row(app):
+    """every other store writes the run out and keeps nothing of the object, and one that kept it let a caller edit a queued run from the outside"""
+    mine = Run(name="work", payload={"who": "paulo"})
+    written = await app.store.add(mine)
+
+    mine.payload["who"] = "changed after the store took it"
+    mine.status = RunStatus.DONE
+
+    stored = await app.get(written.id)
+
+    assert stored.payload == {"who": "paulo"}
+    assert stored.status == RunStatus.PENDING

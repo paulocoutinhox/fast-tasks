@@ -163,11 +163,28 @@ async def test_a_retry_puts_the_run_back_with_a_time_to_come_back_at(store):
     assert await claim_one(store) is None, "it comes back when it is due and not before"
 
 
-@pytest.mark.parametrize("closing", ["complete", "fail", "retry_later"])
+async def test_a_run_handed_back_by_a_worker_that_never_tried_it_keeps_its_attempt(store):
+    """a rolling deploy meets names the older replica does not know, and an attempt spent on nothing is what a reclaim reads as a run with nothing left"""
+    await store.add(a_run(max_attempts=1))
+    taken = await claim_one(store)
+
+    assert await store.release(taken.id, "worker-1", now() - timedelta(seconds=1), "nothing here is called 'greet'", "UnknownTask") is True
+
+    waiting = await store.get(taken.id)
+
+    assert waiting.status == RunStatus.PENDING
+    assert waiting.attempts == 0, "the attempt that never happened is given back"
+    assert (waiting.worker, waiting.lease_until, waiting.started_at) == (None, None, None)
+    assert waiting.error_type == "UnknownTask", "and it says what it is waiting for"
+    assert await store.reclaim(now()) == 0, "nothing is held, so there is nothing to give up on"
+    assert (await claim_one(store, "worker-2")).attempts == 1, "the replica that knows the name gets the whole budget"
+
+
+@pytest.mark.parametrize("closing", ["complete", "fail", "retry_later", "release"])
 async def test_nobody_closes_a_run_they_do_not_hold(store, closing):
     await store.add(a_run())
     taken = await claim_one(store)
-    arguments = {"complete": (now(), None), "fail": (now(), "boom", "Error"), "retry_later": (now(), "boom", "Error")}[closing]
+    arguments = {"complete": (now(), None), "fail": (now(), "boom", "Error"), "retry_later": (now(), "boom", "Error"), "release": (now(), "boom", "Error")}[closing]
 
     assert await getattr(store, closing)(taken.id, "worker-2", *arguments) is False
     assert (await store.get(taken.id)).status == RunStatus.RUNNING

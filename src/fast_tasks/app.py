@@ -54,6 +54,9 @@ class FastTasks:
         if retry_delay < 0:
             raise QueueError(f"'{name}' waits {retry_delay}s before another attempt, and a wait is never negative")
 
+        if max_retry_delay <= 0:
+            raise QueueError(f"'{name}' waits at most {max_retry_delay}s before another attempt, which is a retry due before the one that failed and a queue that hammers instead of backing off")
+
         def declare(handler: Callable) -> Callable:
             self.register(Task(name=name, handler=handler, queue=queue, trigger=trigger_for(every, cron), max_attempts=max_attempts, timeout=timeout, retry_policy=retry_policy, retry_delay=retry_delay, max_retry_delay=max_retry_delay, priority=priority))
 

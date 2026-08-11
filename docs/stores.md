@@ -120,9 +120,9 @@ A replica for failover is fine, since every write goes to the primary. What is n
 database of its own. A run is a hash and the queue it waits in is a sorted set, and an eviction takes
 the first without touching the second: the lane keeps handing out an id whose run is gone.
 
-The store steps over that instead of building a hash out of the fields a claim writes — the claim and
-the reclaim both check the run is still there — so what an eviction costs is the run itself, silently,
-which is the part no code on either side can give back.
+The store steps over that instead of building a hash out of the fields a claim writes — the claim, the
+read that follows it and the reclaim all check the run is still there — so what an eviction costs is
+the run itself, silently, which is the part no code on either side can give back.
 
 `allkeys-lru` on a shared Redis is the setting that does this, and it is a common one.
 
@@ -137,15 +137,19 @@ nothing outside the process that owns it can see a thing.
 
 ## ✍️ Writing your own
 
-Subclass `fast_tasks.store.base.Store` and answer eleven methods. The contract is short, and one rule
+Subclass `fast_tasks.store.base.Store` and answer fourteen methods. The contract is short, and one rule
 runs through all of it:
 
 > **Every method that changes a run is conditional on the state that run was in.**
 
-`claim` only takes a run that is `pending` and due. `complete`, `fail`, `retry_later` and `heartbeat`
-only touch a run whose `worker` is the caller and whose status is `running`. `add` refuses a key that
-is taken. That is what makes two workers safe without a lock anywhere, and a store that answers
-"changed" for a row it did not change breaks the guarantee for everybody.
+`claim` only takes a run that is `pending` and due. `complete`, `fail`, `retry_later`, `release` and
+`heartbeat` only touch a run whose `worker` is the caller and whose status is `running`. `add` refuses
+a key that is taken. That is what makes two workers safe without a lock anywhere, and a store that
+answers "changed" for a row it did not change breaks the guarantee for everybody.
+
+`retry_later` and `release` are the same write with one difference: an attempt that happened stands,
+and one a worker never had anything to try is given back. A store that treats them as the same method
+spends a run's whole budget on a rolling deploy.
 
 The suite in `tests/test_store_contract.py` is written against the interface and parametrized over
 every store. Add yours to the fixture and it inherits the whole thing — that is the intended way to
